@@ -103,22 +103,35 @@ def _bucket_ms(b):
     return (2 ** (b / 8)) / 1000.0
 
 
+OP_TIMEOUT = 15.0   # per-request deadline: a stuck conn counts as an error and is
+                    # closed, instead of hanging forever / leaking a half-open fd.
+
+
 async def _conn_loop(host, port, proxy, deadline, hist, count):
     while time.monotonic() < deadline:
         t0 = time.monotonic()
-        try:
-            reader, writer, sent = await _open(host, port, proxy, REQ)  # pipelined
+        writer = None
+
+        async def _do():
+            nonlocal writer
+            reader, w, sent = await _open(host, port, proxy, REQ)  # pipelined
+            writer = w
             if not sent:
-                writer.write(REQ)
-                await writer.drain()
-            data = await reader.read(4096)            # first chunk has the status line
-            while await reader.read(65536):           # drain to EOF (server closes)
-                pass
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
+                w.write(REQ)
+                await w.drain()
+            # Read exactly one response by Content-Length (don't drain to EOF — an
+            # intercept/keep-alive backend may hold the conn open and hang us).
+            headers = await reader.readuntil(b"\r\n\r\n")
+            cl = 0
+            for line in headers.split(b"\r\n"):
+                if line[:15].lower() == b"content-length:":
+                    cl = int(line[15:].strip()); break
+            if cl:
+                await reader.readexactly(cl)
+            return headers
+
+        try:
+            data = await asyncio.wait_for(_do(), OP_TIMEOUT)
             if data[:12] == b"HTTP/1.1 200":
                 count[0] += 1
                 hist[_bucket((time.monotonic() - t0) * 1e6)] += 1
@@ -126,6 +139,12 @@ async def _conn_loop(host, port, proxy, deadline, hist, count):
                 count[1] += 1
         except Exception:
             count[1] += 1
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
 
 
 async def _conn_loop_ka(host, port, proxy, deadline, hist, count):
