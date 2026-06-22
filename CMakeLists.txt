@@ -26,11 +26,26 @@ add_library(mux STATIC
 )
 target_include_directories(mux PUBLIC libmux/include)
 
-# ---- common: daemon-side helpers (auth, etc.) ----
+# ---- common: daemon-side helpers (auth, net) ----
 add_library(muxcommon STATIC
   common/auth.c
+  common/net.c
 )
 target_include_directories(muxcommon PUBLIC common)
+
+# ---- relay engine: shared poll() loop tying sockets to mux streams ----
+add_library(muxrelay STATIC
+  common/relay.c
+)
+target_include_directories(muxrelay PUBLIC common)
+target_link_libraries(muxrelay PUBLIC mux muxcommon)
+
+# ---- daemons ----
+add_executable(edge      edge/main.c)
+target_link_libraries(edge PRIVATE muxrelay)
+
+add_executable(edge-peer edge-peer/main.c)
+target_link_libraries(edge-peer PRIVATE muxrelay)
 
 # ---- tests ----
 enable_testing()

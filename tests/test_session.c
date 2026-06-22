@@ -8,6 +8,7 @@
 #include "mux.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int g_fail = 0;
@@ -86,7 +87,7 @@ static size_t move(mux_session *src, mux_session *dst, evlog *dstlog) {
     size_t len = 0;
     const uint8_t *buf = mux_send_buf(src, &len);
     if (len == 0) return 0;
-    int consumed = mux_recv(dst, buf, len);
+    int64_t consumed = mux_recv(dst, buf, len);
     if (consumed > 0) mux_send_advance(src, (size_t)consumed);
     drain(dst, dstlog);
     return consumed > 0 ? (size_t)consumed : 0;
@@ -368,7 +369,7 @@ static void test_proto_data_before_hello(void) {
     mux_session *a = mux_session_new(&ca, MUX_ACCEPTOR);
     uint8_t frame[64];
     int n = mux_craft(frame, sizeof frame, MUX_T_DATA, MUX_F_SYN, 2, (const uint8_t*)"x", 1);
-    int c = mux_recv(a, frame, (size_t)n);
+    int64_t c = mux_recv(a, frame, (size_t)n);
     evlog la = {0};
     drain(a, &la);
     CHECK(la.fatal);
@@ -420,6 +421,108 @@ static void test_syn_fin_coalesced(void) {
     mux_session_free(d); mux_session_free(a);
 }
 
+/* Regression for the review's #1/#7: a stream blocked solely on the CONNECTION
+ * window must receive a PER-STREAM WRITABLE when the session window reopens,
+ * not just a sid-0 event. Without the sweep this stream deadlocks forever. */
+static void test_writable_session_unblock(void) {
+    /* session window 10 binds; per-stream window huge so the stream itself is fine */
+    mux_config cd = cfg_with(1u<<20, 10, 0, 0);
+    mux_config ca = cfg_with(1u<<20, 10, 0, 0);
+    mux_session *d = mux_session_new(&cd, MUX_DIALER);
+    mux_session *a = mux_session_new(&ca, MUX_ACCEPTOR);
+    evlog ld = {0}, la = {0};
+    pump(d, a, &ld, &la);
+
+    int64_t sid = mux_open(d, NULL, 0);
+    pump(d, a, &ld, &la);
+
+    uint8_t buf[100]; memset(buf, 'Q', sizeof buf);
+    int64_t w = mux_write(d, (uint32_t)sid, buf, sizeof buf);
+    CHECK_EQ(w, 10);                         /* clamped to the session window */
+    pump(d, a, &ld, &la);
+    CHECK_EQ(la.data_bytes, 10);
+
+    /* acceptor consumes -> credits the CONNECTION window (sid 0 WINDOW_UPDATE) */
+    mux_consume(a, (uint32_t)sid, 10);
+    pump(d, a, &ld, &la);
+
+    /* the dialer must have been woken with a per-stream WRITABLE for THIS sid */
+    int woke = 0;
+    for (size_t i = 0; i < ld.n; i++)
+        if (ld.ev[i].type == MUX_EV_WRITABLE && ld.ev[i].sid == (uint32_t)sid) woke = 1;
+    CHECK(woke);
+
+    /* and writing now makes progress again */
+    int64_t w2 = mux_write(d, (uint32_t)sid, buf, sizeof buf);
+    CHECK_EQ(w2, 10);
+    CHECK(!ld.fatal && !la.fatal);
+    mux_session_free(d); mux_session_free(a);
+}
+
+/* Forge a frame into a handshaked acceptor and assert it goes fatal (or not). */
+static mux_session *handshaked_acceptor(mux_session **dialer_out, evlog *la) {
+    static mux_config ca; memset(&ca, 0, sizeof ca);
+    mux_session *a = mux_session_new(&ca, MUX_ACCEPTOR);
+    static mux_config cd; memset(&cd, 0, sizeof cd);
+    mux_session *d = mux_session_new(&cd, MUX_DIALER);
+    size_t hlen = 0; const uint8_t *hello = mux_send_buf(d, &hlen);
+    mux_recv(a, hello, hlen); drain(a, la);
+    *dialer_out = d;
+    return a;
+}
+
+/* Review #3/#10/#11: oversized / mis-addressed PING is a protocol error. */
+static void test_proto_ping_guards(void) {
+    mux_session *d; evlog la = {0};
+    mux_session *a = handshaked_acceptor(&d, &la);
+    uint8_t f[64];
+    int n = mux_craft(f, sizeof f, MUX_T_PING, 0, MUX_SID_CONTROL, (const uint8_t*)"toolongping", 11);
+    mux_recv(a, f, (size_t)n); drain(a, &la);
+    CHECK(la.fatal);                          /* len != 8 rejected */
+    mux_session_free(d); mux_session_free(a);
+}
+
+/* Review #12: non-SYN DATA on the control id (0) is a protocol violation. */
+static void test_proto_data_on_sid0(void) {
+    mux_session *d; evlog la = {0};
+    mux_session *a = handshaked_acceptor(&d, &la);
+    uint8_t f[64];
+    int n = mux_craft(f, sizeof f, MUX_T_DATA, 0, MUX_SID_CONTROL, (const uint8_t*)"x", 1);
+    mux_recv(a, f, (size_t)n); drain(a, &la);
+    CHECK(la.fatal);
+    mux_session_free(d); mux_session_free(a);
+}
+
+/* Review #9: an over-large SYN metadata blob is rejected. */
+static void test_proto_oversized_meta(void) {
+    mux_session *d; evlog la = {0};
+    mux_session *a = handshaked_acceptor(&d, &la);
+    static uint8_t big[MUX_MAX_META + 64];
+    memset(big, 'M', sizeof big);
+    uint8_t *f = (uint8_t *)malloc(sizeof big + 16);
+    int n = mux_craft(f, sizeof big + 16, MUX_T_DATA, MUX_F_SYN, 1, big, (uint32_t)sizeof big);
+    mux_recv(a, f, (size_t)n); drain(a, &la);
+    CHECK(la.fatal);
+    free(f);
+    mux_session_free(d); mux_session_free(a);
+}
+
+/* Review #13: a DATA frame for an unknown stream is dropped, not RST'd, and
+ * never makes the session fatal. */
+static void test_unknown_stream_ignored(void) {
+    mux_session *d; evlog la = {0};
+    mux_session *a = handshaked_acceptor(&d, &la);
+    /* drain the HELLO_ACK the acceptor queued during the handshake */
+    size_t pre = 0; mux_send_buf(a, &pre); mux_send_advance(a, pre);
+    uint8_t f[64];
+    int n = mux_craft(f, sizeof f, MUX_T_DATA, 0, 7, (const uint8_t*)"hi", 2);
+    mux_recv(a, f, (size_t)n); drain(a, &la);
+    CHECK(!la.fatal);                         /* silently ignored */
+    size_t olen = 0; mux_send_buf(a, &olen);  /* and no RST emitted back */
+    CHECK_EQ(olen, 0);
+    mux_session_free(d); mux_session_free(a);
+}
+
 int main(void) {
     test_handshake();
     test_open_data_close();
@@ -433,6 +536,11 @@ int main(void) {
     test_proto_control_nonzero_sid();
     test_goaway();
     test_syn_fin_coalesced();
+    test_writable_session_unblock();
+    test_proto_ping_guards();
+    test_proto_data_on_sid0();
+    test_proto_oversized_meta();
+    test_unknown_stream_ignored();
 
     if (g_fail) { fprintf(stderr, "\n%d check(s) failed\n", g_fail); return 1; }
     printf("all session state-machine tests passed\n");

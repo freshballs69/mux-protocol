@@ -66,7 +66,7 @@ struct mux_session {
     int64_t  sess_send_win;
     int64_t  sess_recv_win;
     int64_t  sess_recv_pending;
-    uint8_t  sess_send_blocked;
+    size_t   blocked_count;     /* streams currently flagged send_blocked    */
 
     /* handshake */
     uint8_t  peer_hello_seen;
@@ -98,9 +98,18 @@ struct mux_session {
     uint64_t ping_sent_ms;
     uint64_t ping_nonce;
 
+    uint32_t max_out_buffer;    /* hard ceiling on out.len (anti-DoS)        */
+
     outbuf out;
     evq    q;
 };
+
+/* Mark/unmark a stream as send-blocked, keeping blocked_count accurate so the
+ * connection-window sweep can find blocked streams cheaply. */
+static void set_blocked(mux_session *s, mux_stream *st, int blocked) {
+    if (blocked && !st->send_blocked) { st->send_blocked = 1; s->blocked_count++; }
+    else if (!blocked && st->send_blocked) { st->send_blocked = 0; s->blocked_count--; }
+}
 
 /* Hard caps on per-session opaque blobs carried in HELLO (keeps the HELLO
  * crafting buffer bounded and bounds handshake memory). */
@@ -110,7 +119,9 @@ struct mux_session {
 /* Output buffer                                                      */
 /* ================================================================== */
 
-static int ob_reserve(outbuf *o, size_t need) {
+static void raise_fatal(mux_session *s, uint32_t code); /* defined below */
+
+static int ob_reserve(outbuf *o, size_t need, size_t limit) {
     if (o->len + need <= o->cap)
         return 0;
     /* Compact already-sent bytes to the front before growing. */
@@ -121,6 +132,10 @@ static int ob_reserve(outbuf *o, size_t need) {
         if (o->len + need <= o->cap)
             return 0;
     }
+    /* Refuse to grow past the configured ceiling: this is the anti-DoS /
+     * backpressure backstop. The host should have stopped feeding long before. */
+    if (limit && o->len + need > limit)
+        return MUX_ERR_NOSPACE;
     size_t ncap = o->cap ? o->cap : 4096;
     while (ncap < o->len + need)
         ncap *= 2;
@@ -132,11 +147,14 @@ static int ob_reserve(outbuf *o, size_t need) {
     return 0;
 }
 
-/* Craft one frame straight into the output buffer. */
+/* Craft one frame straight into the output buffer. On overflow of the output
+ * ceiling the session is failed (defense in depth) and a negative code returned. */
 static int emit(mux_session *s, uint8_t type, uint16_t flags, uint32_t sid,
                 const uint8_t *payload, uint32_t plen) {
-    if (ob_reserve(&s->out, (size_t)MUX_HEADER_SIZE + plen) != 0)
-        return MUX_ERR_NOMEM;
+    if (ob_reserve(&s->out, (size_t)MUX_HEADER_SIZE + plen, s->max_out_buffer) != 0) {
+        raise_fatal(s, MUX_CODE_INTERNAL);
+        return MUX_ERR_NOSPACE;
+    }
     int n = mux_craft(s->out.buf + s->out.len, s->out.cap - s->out.len,
                       type, flags, sid, payload, plen);
     if (n < 0)
@@ -268,6 +286,10 @@ static mux_stream *st_insert(mux_session *s, uint32_t sid) {
 }
 
 static void st_remove(mux_session *s, mux_stream *e) {
+    if (e->send_blocked) {                   /* keep blocked_count exact */
+        e->send_blocked = 0;
+        s->blocked_count--;
+    }
     e->slot = SLOT_TOMB;
     s->tab_count--;
     s->tab_tombs++;
@@ -310,6 +332,7 @@ mux_session *mux_session_new(const mux_config *cfg, mux_role role) {
         ? cfg->keepalive_timeout_ms
         : (s->heartbeat_ms ? s->heartbeat_ms * 3u : 0u);
     s->weight          = cfg->weight;
+    s->max_out_buffer  = nz(cfg->max_out_buffer, MUX_DEFAULT_MAX_OUT_BUFFER);
 
     /* Until the peer's HELLO arrives, assume protocol defaults so a stream
      * opened immediately after the handshake has a sane initial send window. */
@@ -398,19 +421,30 @@ static int send_hello(mux_session *s, int ack) {
 /* Flow-control crediting (receive side)                              */
 /* ================================================================== */
 
+/* Emit `pending` bytes of credit on `sid` as one or more WINDOW_UPDATE frames,
+ * advancing `*win` by exactly the amount placed on the wire. Splitting into
+ * <= UINT32_MAX chunks keeps the wire value and the local window in lockstep
+ * even when a single huge consume accumulates more than 4 GiB of credit. */
+static void credit_emit(mux_session *s, uint32_t sid, int64_t *win, int64_t *pending) {
+    while (*pending > 0) {
+        uint32_t chunk = (*pending > (int64_t)0xFFFFFFFF)
+                       ? 0xFFFFFFFFu : (uint32_t)*pending;
+        uint8_t b[4];
+        be_put32(b, chunk);
+        if (emit(s, MUX_T_WINDOW_UPDATE, 0, sid, b, 4) != 0)
+            return;                 /* out buffer full / fatal: leave the rest pending */
+        *win     += (int64_t)chunk;
+        *pending -= (int64_t)chunk;
+    }
+}
+
 static void credit_stream(mux_session *s, mux_stream *st) {
     if (st->recv_pending <= 0)
         return;
     /* Refill at the half-window watermark to batch WINDOW_UPDATE frames. */
     if (st->recv_pending * 2 < (int64_t)s->init_window)
         return;
-    uint32_t add = (uint32_t)st->recv_pending;
-    uint8_t b[4];
-    be_put32(b, add);
-    if (emit(s, MUX_T_WINDOW_UPDATE, 0, st->sid, b, 4) == 0) {
-        st->recv_win += st->recv_pending;
-        st->recv_pending = 0;
-    }
+    credit_emit(s, st->sid, &st->recv_win, &st->recv_pending);
 }
 
 static void credit_session(mux_session *s) {
@@ -418,13 +452,7 @@ static void credit_session(mux_session *s) {
         return;
     if (s->sess_recv_pending * 2 < (int64_t)s->session_window)
         return;
-    uint32_t add = (uint32_t)s->sess_recv_pending;
-    uint8_t b[4];
-    be_put32(b, add);
-    if (emit(s, MUX_T_WINDOW_UPDATE, 0, MUX_SID_CONTROL, b, 4) == 0) {
-        s->sess_recv_win += s->sess_recv_pending;
-        s->sess_recv_pending = 0;
-    }
+    credit_emit(s, MUX_SID_CONTROL, &s->sess_recv_win, &s->sess_recv_pending);
 }
 
 /* ================================================================== */
@@ -449,6 +477,8 @@ static void on_data(mux_session *s, const mux_frame_t *f) {
         if (st_find(s, f->sid)) { raise_fatal(s, MUX_CODE_PROTOCOL); return; }
         /* Stream ids must increase monotonically; a reused/old id is illegal. */
         if (f->sid <= s->max_remote_sid) { raise_fatal(s, MUX_CODE_PROTOCOL); return; }
+        /* SYN metadata is bounded independently of the data windows. */
+        if (f->len > MUX_MAX_META) { raise_fatal(s, MUX_CODE_PROTOCOL); return; }
 
         /* Refuse (not fatal) if we're at our inbound cap or draining. */
         if (s->tab_count >= s->max_streams || s->local_goaway) {
@@ -481,14 +511,17 @@ static void on_data(mux_session *s, const mux_frame_t *f) {
         return;
     }
 
-    /* Non-SYN DATA: must reference a live stream. */
+    /* Stream id 0 is reserved for control frames; DATA on it is illegal. */
+    if (f->sid == MUX_SID_CONTROL) { raise_fatal(s, MUX_CODE_PROTOCOL); return; }
+
+    /* Non-SYN DATA: must reference a live stream. A frame for an unknown id is
+     * almost always one in flight when we closed the stream — drop it silently
+     * rather than answering with an RST, which would amplify into a storm and
+     * mis-label benign late frames as errors. The bytes self-limit: we never
+     * credit them, so the peer's own send window drains and it stalls. */
     mux_stream *st = st_find(s, f->sid);
-    if (!st) {
-        /* Unknown/closed stream: tell the peer to stop. */
-        uint8_t code[4]; be_put32(code, MUX_CODE_PROTOCOL);
-        (void)emit(s, MUX_T_DATA, MUX_F_RST, f->sid, code, 4);
+    if (!st)
         return;
-    }
 
     if (fl & MUX_F_RST) {
         mux_event e; memset(&e, 0, sizeof e);
@@ -545,35 +578,51 @@ static void on_window_update(mux_session *s, const mux_frame_t *f) {
     if (f->sid == MUX_SID_CONTROL) {
         int was_blocked = s->sess_send_win <= 0;
         s->sess_send_win += (int64_t)credit;
-        if (s->sess_send_win > (int64_t)1 << 48) { raise_fatal(s, MUX_CODE_FLOW_CONTROL); return; }
-        if (was_blocked && s->sess_send_win > 0)
-            ev_simple(s, MUX_EV_WRITABLE, MUX_SID_CONTROL);
+        if (s->sess_send_win > ((int64_t)1 << 48)) { raise_fatal(s, MUX_CODE_FLOW_CONTROL); return; }
+        /* The connection window just reopened: a stream can be blocked solely
+         * on it while its own window is healthy, so sweep every blocked stream
+         * and wake the ones that now have room on BOTH windows. Without this the
+         * stream deadlocks at window 0 (a per-stream WU never comes, because the
+         * stuck bytes are never sent and thus never consumed/credited). */
+        if (was_blocked && s->sess_send_win > 0 && s->blocked_count > 0) {
+            for (size_t i = 0; i < s->tab_cap; i++) {
+                mux_stream *st = &s->tab[i];
+                if (st->slot == SLOT_USED && st->send_blocked && st->send_win > 0) {
+                    set_blocked(s, st, 0);
+                    ev_simple(s, MUX_EV_WRITABLE, st->sid);
+                }
+            }
+        }
         return;
     }
 
     mux_stream *st = st_find(s, f->sid);
     if (!st)
         return;                             /* closed stream: ignore */
-    int was_blocked = st->send_win <= 0;
     st->send_win += (int64_t)credit;
-    if (st->send_win > (int64_t)1 << 48) { raise_fatal(s, MUX_CODE_FLOW_CONTROL); return; }
-    if (st->send_blocked && was_blocked && st->send_win > 0) {
-        st->send_blocked = 0;
+    if (st->send_win > ((int64_t)1 << 48)) { raise_fatal(s, MUX_CODE_FLOW_CONTROL); return; }
+    /* Wake the stream only when BOTH windows allow progress; if it is blocked
+     * on the connection window the sid-0 sweep above will wake it instead. */
+    if (st->send_blocked && st->send_win > 0 && s->sess_send_win > 0) {
+        set_blocked(s, st, 0);
         ev_simple(s, MUX_EV_WRITABLE, f->sid);
     }
 }
 
 static void on_ping(mux_session *s, const mux_frame_t *f) {
+    /* PING is a fixed 8-byte control frame. Enforcing both the id and the
+     * length stops a peer from using oversized echoes to force unbounded
+     * output-buffer growth (echo amplification). */
+    if (f->sid != MUX_SID_CONTROL || f->len != 8) { raise_fatal(s, MUX_CODE_PROTOCOL); return; }
     if (f->flags & MUX_F_ACK) {
-        /* Echo of our keepalive — peer is alive. */
-        s->ping_outstanding = 0;
+        s->ping_outstanding = 0;            /* echo of our keepalive: peer alive */
         return;
     }
-    /* Reflect the opaque payload with the ACK flag set. */
-    (void)emit(s, MUX_T_PING, MUX_F_ACK, MUX_SID_CONTROL, f->payload, f->len);
+    (void)emit(s, MUX_T_PING, MUX_F_ACK, MUX_SID_CONTROL, f->payload, 8);
 }
 
 static void on_goaway(mux_session *s, const mux_frame_t *f) {
+    if (f->sid != MUX_SID_CONTROL) { raise_fatal(s, MUX_CODE_PROTOCOL); return; }
     if (f->len < 8) { raise_fatal(s, MUX_CODE_PROTOCOL); return; }
     mux_event e; memset(&e, 0, sizeof e);
     e.type = MUX_EV_GOAWAY;
@@ -583,6 +632,7 @@ static void on_goaway(mux_session *s, const mux_frame_t *f) {
 }
 
 static void on_capacity(mux_session *s, const mux_frame_t *f) {
+    if (f->sid != MUX_SID_CONTROL) { raise_fatal(s, MUX_CODE_PROTOCOL); return; }
     if (f->len != 4) { raise_fatal(s, MUX_CODE_PROTOCOL); return; }
     mux_event e; memset(&e, 0, sizeof e);
     e.type = MUX_EV_CAPACITY;
@@ -647,14 +697,19 @@ static void process_frame(mux_session *s, const mux_frame_t *f) {
 /* Public API                                                         */
 /* ================================================================== */
 
-int mux_recv(mux_session *s, const uint8_t *buf, size_t len) {
+int64_t mux_recv(mux_session *s, const uint8_t *buf, size_t len) {
     if (!s || (!buf && len))
         return MUX_ERR_PARAM;
     if (s->dead)
         return MUX_ERR_STATE;
 
     size_t cursor = 0;
-    while (cursor < len && !s->dead) {
+    while (cursor < len) {
+        /* Soft-cap the event queue: stop consuming so the host drains events
+         * (bounding queue memory). The unconsumed tail is re-fed next call. */
+        if (s->q.count >= MUX_EVENT_QUEUE_SOFT_CAP)
+            break;
+
         mux_frame_t f;
         size_t consumed = 0;
         int r = mux_parse(buf + cursor, len - cursor, &f, &consumed);
@@ -662,12 +717,14 @@ int mux_recv(mux_session *s, const uint8_t *buf, size_t len) {
             break;                          /* wait for more bytes */
         if (r != MUX_OK) {                  /* framing-level violation */
             raise_fatal(s, MUX_CODE_PROTOCOL);
-            break;
+            break;                          /* exclude the offending frame */
         }
         process_frame(s, &f);
+        if (s->dead)
+            break;                          /* semantic fatal: also exclude it */
         cursor += consumed;
     }
-    return (int)cursor;
+    return (int64_t)cursor;
 }
 
 int64_t mux_open(mux_session *s, const uint8_t *meta, size_t meta_len) {
@@ -675,7 +732,7 @@ int64_t mux_open(mux_session *s, const uint8_t *meta, size_t meta_len) {
     if (s->dead)                  return MUX_ERR_STATE;
     if (!s->peer_hello_seen)      return MUX_ERR_STATE;   /* need peer window */
     if (s->local_goaway)          return MUX_ERR_STATE;
-    if (meta_len > MUX_MAX_PAYLOAD) return MUX_ERR_PARAM;
+    if (meta_len > MUX_MAX_META)  return MUX_ERR_PARAM;
     if (s->tab_count >= s->peer_max_streams) return MUX_ERR_NOMEM;
 
     uint32_t sid = s->next_local_sid;
@@ -707,9 +764,7 @@ int64_t mux_write(mux_session *s, uint32_t sid, const uint8_t *p, size_t n) {
     if (s->sess_send_win < room)
         room = s->sess_send_win;
     if (room <= 0) {
-        st->send_blocked = 1;
-        if (s->sess_send_win <= 0)
-            s->sess_send_blocked = 1;
+        set_blocked(s, st, 1);          /* blocked on stream and/or session win */
         return 0;
     }
     size_t want = n;
@@ -722,13 +777,14 @@ int64_t mux_write(mux_session *s, uint32_t sid, const uint8_t *p, size_t n) {
         if (chunk > MUX_MAX_DATA_FRAME)
             chunk = MUX_MAX_DATA_FRAME;
         if (emit(s, MUX_T_DATA, 0, sid, p + sent, (uint32_t)chunk) != 0)
-            break;                          /* out of memory: stop early */
+            break;                          /* out buffer full / fatal: stop early */
         sent += chunk;
     }
     st->send_win     -= (int64_t)sent;
     s->sess_send_win -= (int64_t)sent;
+    /* Couldn't place everything: mark blocked so a later WINDOW_UPDATE wakes us. */
     if (sent < n && (st->send_win <= 0 || s->sess_send_win <= 0))
-        st->send_blocked = 1;
+        set_blocked(s, st, 1);
     return (int64_t)sent;
 }
 
@@ -832,6 +888,10 @@ const uint8_t *mux_send_buf(mux_session *s, size_t *len) {
     if (!s || !len) { if (len) *len = 0; return NULL; }
     *len = s->out.len - s->out.spos;
     return s->out.buf + s->out.spos;
+}
+
+size_t mux_out_pending(mux_session *s) {
+    return s ? s->out.len - s->out.spos : 0;
 }
 
 void mux_send_advance(mux_session *s, size_t n) {

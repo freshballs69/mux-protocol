@@ -1,0 +1,148 @@
+#include "net.h"
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int net_set_nonblock(int fd) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0) return -1;
+    return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+
+int net_set_nodelay(int fd) {
+    int one = 1;
+    return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+}
+
+int net_listen(const char *host, uint16_t port, int backlog) {
+    char portstr[16];
+    snprintf(portstr, sizeof portstr, "%u", (unsigned)port);
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags    = AI_PASSIVE;
+    const char *node = (host && host[0]) ? host : NULL;
+    if (getaddrinfo(node, portstr, &hints, &res) != 0)
+        return -1;
+
+    int fd = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+#ifdef SO_REUSEPORT
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
+#endif
+        if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 &&
+            listen(fd, backlog) == 0) {
+            break;
+        }
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    if (fd >= 0)
+        net_set_nonblock(fd);
+    return fd;
+}
+
+static void fill_peer(const struct sockaddr *sa, socklen_t sl, char *peer, size_t peerlen) {
+    if (!peer || peerlen == 0) return;
+    char host[NI_MAXHOST], serv[NI_MAXSERV];
+    if (getnameinfo(sa, sl, host, sizeof host, serv, sizeof serv,
+                    NI_NUMERICHOST | NI_NUMERICSERV) == 0)
+        snprintf(peer, peerlen, "%s:%s", host, serv);
+    else
+        snprintf(peer, peerlen, "?");
+}
+
+int net_accept(int listen_fd, char *peer, size_t peerlen) {
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof ss;
+    int fd = accept(listen_fd, (struct sockaddr *)&ss, &sl);
+    if (fd < 0)
+        return -1;
+    net_set_nonblock(fd);
+    net_set_nodelay(fd);
+    fill_peer((struct sockaddr *)&ss, sl, peer, peerlen);
+    return fd;
+}
+
+int net_dial(const char *host, uint16_t port) {
+    char portstr[16];
+    snprintf(portstr, sizeof portstr, "%u", (unsigned)port);
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, portstr, &hints, &res) != 0)
+        return -1;
+
+    int fd = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        net_set_nonblock(fd);
+        net_set_nodelay(fd);
+        int r = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (r == 0 || errno == EINPROGRESS)
+            break;                          /* connected or in progress */
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    return fd;
+}
+
+int net_socket_error(int fd) {
+    int err = 0;
+    socklen_t len = sizeof err;
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0)
+        return errno;
+    return err;
+}
+
+int os_random(void *buf, size_t n) {
+    /* /dev/urandom is universally available on Linux and macOS. */
+    FILE *fp = fopen("/dev/urandom", "rb");
+    if (!fp)
+        return -1;
+    size_t got = fread(buf, 1, n, fp);
+    fclose(fp);
+    return got == n ? 0 : -1;
+}
+
+int net_parse_addr(const char *s, char *host_out, size_t cap, uint16_t *port_out) {
+    if (!s || !host_out || !port_out || cap == 0)
+        return -1;
+    const char *colon = strrchr(s, ':');
+    if (!colon) {
+        /* bare port */
+        host_out[0] = 0;
+        long p = strtol(s, NULL, 10);
+        if (p <= 0 || p > 65535) return -1;
+        *port_out = (uint16_t)p;
+        return 0;
+    }
+    size_t hlen = (size_t)(colon - s);
+    if (hlen >= cap) return -1;
+    memcpy(host_out, s, hlen);
+    host_out[hlen] = 0;
+    long p = strtol(colon + 1, NULL, 10);
+    if (p <= 0 || p > 65535) return -1;
+    *port_out = (uint16_t)p;
+    return 0;
+}

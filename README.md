@@ -76,6 +76,29 @@ Notable design decisions (some deliberately diverge from `MUX.md`):
 - **Zero-copy payload views.** `STREAM_DATA`/`STREAM_OPENED` point into the recv
   buffer and are valid until the next `mux_recv`.
 
+## Running it
+
+A complete proxy: `client → edge:accept-port → mux tunnel → edge-peer → backend`.
+
+```sh
+# backend (anything TCP; here a static file server)
+python3 -m http.server 18080
+
+# edge: public on :5000, uplink listener on :5001
+./build/edge --accept-port 5000 --mux-port 5001 --token s3cr3t
+
+# edge-peer: dials the edge, forwards each stream to the backend
+./build/edge-peer --connect 127.0.0.1:5001 --backend 127.0.0.1:18080 --token s3cr3t
+
+curl http://127.0.0.1:5000/        # flows through the mux to the backend
+```
+
+The pre-shared `--token` (or `MUX_TOKEN` env) is proven on both ends via
+HMAC-SHA256 over the peer's HELLO nonce. Verified end-to-end: 4 MiB and 8
+concurrent transfers are byte-perfect under ASan/UBSan.
+
+> macOS note: port 5000 is taken by AirPlay; use another for local testing.
+
 ## Status
 
 | Milestone | State |
@@ -83,9 +106,13 @@ Notable design decisions (some deliberately diverge from `MUX.md`):
 | 1. Framing codec + TLV + fuzz | ✅ done |
 | 2. Session state machine | ✅ done |
 | 3. Session-level flow control + memory cap | ✅ done (folded into 2) |
+| —  Adversarial review pass (18 findings fixed) | ✅ done |
+| —  PSK tunnel auth (HMAC-SHA256) | ✅ done |
+| 5. edge daemon (`poll()`) | ✅ done (MVP) |
+| 6. edge-peer (single backend; no SWRR yet) | ✅ done (MVP) |
 | 4. libpeer worker SDK | ⬜ next |
-| 5. edge daemon (`poll()` v1) | ⬜ |
-| 6. edge-peer router/balancer | ⬜ |
+| 6b. SWRR balancing + multi-worker | ⬜ |
+| 7. TLS/Noise transport wrapper | ⬜ |
 
-> Event loop: v1 uses portable `poll()` (runs on Linux and macOS).
+> Event loop: uses portable `poll()` (runs on Linux and macOS).
 > `epoll`/`io_uring`/`kqueue` + `splice` are a later throughput milestone.

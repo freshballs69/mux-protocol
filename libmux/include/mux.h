@@ -162,10 +162,11 @@ int mux_tlv_next(const uint8_t *buf, size_t len, size_t *cursor,
  *   send path:   mux_open/write/close/... -> mux_send_buf()/advance() -> socket
  *   time path:   mux_on_timer(now_ms) on the returned deadline
  *
- * Lifetime contract for zero-copy views: STREAM_DATA/STREAM_OPENED events
- * carry pointers INTO the buffer most recently passed to mux_recv(). They
- * are valid only until the next mux_recv() (or mux_session_free). Drain all
- * events for a recv before issuing the next recv; copy out anything kept.
+ * Lifetime contract for zero-copy views: STREAM_DATA/STREAM_OPENED (meta) and
+ * PEER_HELLO (peer_id/auth/nonce) events carry pointers INTO the buffer most
+ * recently passed to mux_recv(). They are valid only until the next mux_recv()
+ * (or mux_session_free). Drain all events for a recv before issuing the next
+ * recv; copy out anything kept.
  */
 
 #define MUX_DEFAULT_INIT_WINDOW    (256u * 1024u)        /* per-stream      */
@@ -175,6 +176,17 @@ int mux_tlv_next(const uint8_t *buf, size_t len, size_t *cursor,
 /* DATA writes are chunked into frames no larger than this so large writes
  * still interleave fairly with other streams' frames. */
 #define MUX_MAX_DATA_FRAME         (64u * 1024u)
+/* SYN metadata (PROXY header / TLVs) is bounded independently of the data
+ * flow-control windows; a larger SYN payload is rejected as a protocol error. */
+#define MUX_MAX_META               8192u
+/* Hard ceiling on the internal output buffer (anti-DoS / backpressure). When
+ * crossing it the session is failed rather than allocating without bound; a
+ * well-behaved host drains via mux_send_buf and gates mux_recv on
+ * mux_out_pending long before this. 0 in config selects this default. */
+#define MUX_DEFAULT_MAX_OUT_BUFFER (64u * 1024u * 1024u)
+/* Soft cap on the event queue: mux_recv stops consuming input once this many
+ * events are pending so the host must drain them, bounding queue memory. */
+#define MUX_EVENT_QUEUE_SOFT_CAP   4096u
 
 /* Role fixes stream-id parity and who sends HELLO vs HELLO_ACK. It follows
  * the TCP dial direction and is independent of who opens logical streams:
@@ -194,6 +206,7 @@ typedef struct {
     uint32_t heartbeat_ms;    /* PING interval; 0 disables keepalive        */
     uint32_t keepalive_timeout_ms; /* dead if no echo within (0 => 3x hb)   */
     uint32_t weight;          /* advertised balancing weight                */
+    uint32_t max_out_buffer;  /* output-buffer ceiling (0 => default)       */
 
     const uint8_t *peer_id;   size_t peer_id_len;   /* opaque identity      */
     const uint8_t *auth;      size_t auth_len;      /* opaque AUTH blob      */
@@ -209,7 +222,7 @@ typedef enum {
     MUX_EV_STREAM_DATA,   /* stream bytes; u.data is a zero-copy recv view     */
     MUX_EV_STREAM_CLOSED, /* peer half-closed (FIN); no more inbound data      */
     MUX_EV_STREAM_RESET,  /* stream aborted (RST); u.reset.code                */
-    MUX_EV_WRITABLE,      /* send window reopened; retry writes. sid 0 = session*/
+    MUX_EV_WRITABLE,      /* a specific stream's send window reopened; retry it */
     MUX_EV_PEER_HELLO,    /* handshake parameters from peer; u.hello           */
     MUX_EV_CAPACITY,      /* peer weight changed; u.capacity (0 = draining)    */
     MUX_EV_GOAWAY,        /* peer is draining; u.goaway                        */
@@ -242,11 +255,13 @@ mux_session *mux_session_new(const mux_config *cfg, mux_role role);
 void         mux_session_free(mux_session *s);
 
 /* Feed transport bytes. Parses as many whole frames as present, applying
- * state transitions and queueing events. Returns the number of bytes
- * consumed (>= 0; a trailing partial frame is left unconsumed for the next
- * call) or a negative code. A protocol violation queues MUX_EV_FATAL and
- * returns the bytes consumed up to the offending frame. */
-int mux_recv(mux_session *s, const uint8_t *buf, size_t len);
+ * state transitions and queueing events. Returns the number of bytes consumed
+ * (>= 0; a trailing partial frame, or input beyond the event-queue soft cap,
+ * is left unconsumed for the next call) or a negative code. A protocol
+ * violation queues MUX_EV_FATAL and returns the bytes consumed up to (not
+ * including) the offending frame. The caller MUST retain any unconsumed tail
+ * and re-feed it, and SHOULD drain events between calls. */
+int64_t mux_recv(mux_session *s, const uint8_t *buf, size_t len);
 
 /* Open a new outbound stream carrying optional metadata (the SYN payload,
  * e.g. PROXY-protocol TLVs). Returns the new stream id (>= 1) or a negative
@@ -289,6 +304,12 @@ uint64_t mux_on_timer(mux_session *s, uint64_t now_ms);
  * *len is set to the byte count (0 if nothing pending). */
 const uint8_t *mux_send_buf(mux_session *s, size_t *len);
 void           mux_send_advance(mux_session *s, size_t n);
+
+/* Bytes currently pending in the output buffer. The host uses this to apply
+ * transport backpressure: stop calling mux_recv (stop reading the tunnel) while
+ * this stays high, so a slow transport cannot make the core buffer without
+ * bound. */
+size_t         mux_out_pending(mux_session *s);
 
 /* Pop the next queued event into *ev. Returns 1 if one was written, 0 if
  * the queue is empty. */
