@@ -41,6 +41,10 @@ int  net_set_nodelay(int fd);
 /* Fill buf with n cryptographically-random bytes. Returns 0 on success. */
 int  os_random(void *buf, size_t n);
 
+/* Raise RLIMIT_NOFILE toward its hard cap so the process can hold many sockets.
+ * Returns the soft limit now in effect. */
+long net_raise_fd_limit(void);
+
 /* Parse "host:port" (or ":port"/"port") into host + port. Returns 0 on success.
  * `host_out` gets the host (may be empty for any); cap is its size. */
 int net_parse_addr(const char *s, char *host_out, size_t cap, uint16_t *port_out);

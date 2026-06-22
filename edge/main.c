@@ -73,6 +73,9 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_sigint);
     signal(SIGPIPE, SIG_IGN);
 
+    long fdlim = net_raise_fd_limit();      /* edge holds one fd per public conn */
+    fprintf(stderr, "[edge] fd limit: %ld\n", fdlim);
+
     int public_fd = net_listen(NULL, (uint16_t)accept_port, 1024);
     if (public_fd < 0) { fprintf(stderr, "[edge] cannot listen on :%ld\n", accept_port); return 1; }
     int mux_fd = net_listen(NULL, (uint16_t)mux_port, 16);

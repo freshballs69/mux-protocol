@@ -30,6 +30,7 @@ target_include_directories(mux PUBLIC libmux/include)
 add_library(muxcommon STATIC
   common/auth.c
   common/net.c
+  common/evloop.c
 )
 target_include_directories(muxcommon PUBLIC common)
 

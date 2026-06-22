@@ -3,6 +3,8 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <sys/resource.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -182,6 +184,26 @@ int net_socket_error(int fd) {
     if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0)
         return errno;
     return err;
+}
+
+long net_raise_fd_limit(void) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0)
+        return -1;
+    rlim_t want = rl.rlim_max;
+#ifdef __APPLE__
+    /* macOS caps the effective NOFILE at kern.maxfilesperproc; OPEN_MAX is the
+     * portable conservative ceiling that setrlimit will accept. */
+    if (want == RLIM_INFINITY || want > OPEN_MAX) want = OPEN_MAX;
+#endif
+    rl.rlim_cur = want;
+    if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
+        /* fall back: try the current hard limit verbatim */
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0) return (long)rl.rlim_cur;
+        return -1;
+    }
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0) return -1;
+    return (long)rl.rlim_cur;
 }
 
 int os_random(void *buf, size_t n) {

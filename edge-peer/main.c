@@ -84,6 +84,7 @@ int main(int argc, char **argv) {
     if (!token) token = getenv("MUX_TOKEN");
 
     signal(SIGINT, on_sigint); signal(SIGTERM, on_sigint); signal(SIGPIPE, SIG_IGN);
+    net_raise_fd_limit();
 
     if (backend && nworkers == 0)
         return run_backend_mode(connect_addr, backend, token);
