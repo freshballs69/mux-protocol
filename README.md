@@ -123,19 +123,21 @@ N-replicas-one-socket-each deployment.
 
 ### Docker
 
-One multi-stage image builds `edge`, `edge-peer`, `http_worker` and the
-`muxpeer` Python module; the command picks the role. Inside Linux containers the
-relay uses `epoll`.
+Two images: `Dockerfile` builds the C daemons (`edge`/`edge-peer`/`http_worker`),
+and `examples/python-app/Dockerfile` builds the Python backend — its own image
+where `supervisord` runs four worker replicas, each binding its own
+`/sockets/app_NN.sock`. Inside Linux containers the relay uses `epoll`.
 
 ```sh
 MUX_TOKEN=s3cr3t docker compose -f deploy/docker-compose.yml up --build
-curl localhost:8080/        # -> handled by one of four python workers
+curl localhost:8080/        # -> "hello from W0x ...", balanced across replicas
 ```
 
-`docker-compose.yml` runs a public **edge** container and a **backend** container
-whose `supervisord` (see `deploy/supervisord.docker.conf`) launches four worker
-replicas — each binding its own `/run/mux/app_NN.sock` — plus the `edge-peer`
-that dials the edge and those sockets.
+`deploy/docker-compose.yml` wires three services — **edge** (public), **app**
+(the supervisord/4-replica Python image), and **edge-peer** (dials the edge and
+each worker socket) — with the worker unix sockets on a volume shared between
+`app` and `edge-peer`. Verified in-container: 40 requests split 10/10/10/10
+across the replicas; 600 at 100-way concurrency all return 200.
 
 ## Status
 
