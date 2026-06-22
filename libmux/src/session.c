@@ -393,11 +393,18 @@ static int send_hello(mux_session *s, int ack) {
     size_t off = 0;
     int r;
 
-#define TLV_U32(T, V) do { r = put_u32_tlv(blob, sizeof blob, off, (T), (V)); \
-                           if (r < 0) return r; off = (size_t)r; } while (0)
-#define TLV_BLOB(T, P, N) do { if ((N)) { \
-        r = mux_tlv_put(blob, sizeof blob, off, (T), (P), (uint16_t)(N)); \
-        if (r < 0) return r; off = (size_t)r; } } while (0)
+#define TLV_U32(T, V) do { \
+        r = put_u32_tlv(blob, sizeof blob, off, (T), (V)); \
+        if (r < 0) { return r; } \
+        off = (size_t)r; \
+    } while (0)
+#define TLV_BLOB(T, P, N) do { \
+        if ((N)) { \
+            r = mux_tlv_put(blob, sizeof blob, off, (T), (P), (uint16_t)(N)); \
+            if (r < 0) { return r; } \
+            off = (size_t)r; \
+        } \
+    } while (0)
 
     TLV_U32(MUX_TLV_WEIGHT,         s->weight);
     TLV_U32(MUX_TLV_MAX_STREAMS,    s->max_streams);

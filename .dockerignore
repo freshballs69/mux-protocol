@@ -1,0 +1,9 @@
+.git
+build/
+python/build/
+python/*.so
+compile_commands.json
+**/__pycache__/
+*.o
+*.a
+.DS_Store

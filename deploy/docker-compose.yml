@@ -1,0 +1,51 @@
+# Full stack:
+#   curl localhost:8080  ─▶  edge :5000 ──mux──▶ edge-peer ──▶ 4 python workers
+#                                                              (unix sockets)
+#
+#   MUX_TOKEN=s3cr3t docker compose -f deploy/docker-compose.yml up --build
+#   curl localhost:8080/        # -> "hello from W0x ..." (balanced across replicas)
+#
+# Three services:
+#   edge       public ingress + uplink listener (C daemon image)
+#   edge-peer  dials the edge and every worker socket; SWRR balances (C image)
+#   app        supervisord running 4 Python worker replicas (own Dockerfile),
+#              each binding /sockets/app_NN.sock on a volume shared with edge-peer
+x-token: &token ${MUX_TOKEN:-s3cr3t}
+
+services:
+  edge:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: edge --accept-port 5000 --mux-port 5001 --token ${MUX_TOKEN:-s3cr3t}
+    ports:
+      - "8080:5000"            # public ingress -> host :8080
+
+  app:
+    build:
+      context: ..
+      dockerfile: examples/python-app/Dockerfile
+    environment:
+      MUX_TOKEN: ${MUX_TOKEN:-s3cr3t}
+    volumes:
+      - sockets:/sockets       # the worker unix sockets live here
+
+  edge-peer:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: >
+      edge-peer --connect edge:5001
+      --worker /sockets/app_00.sock
+      --worker /sockets/app_01.sock
+      --worker /sockets/app_02.sock
+      --worker /sockets/app_03.sock
+      --token ${MUX_TOKEN:-s3cr3t}
+    volumes:
+      - sockets:/sockets       # same volume, to reach the worker sockets
+    depends_on:
+      - edge
+      - app
+
+volumes:
+  sockets:

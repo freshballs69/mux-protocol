@@ -27,7 +27,9 @@ ext = Extension(
         os.path.join(ROOT, "libmux/include"),
         os.path.join(ROOT, "common"),
     ],
-    extra_compile_args=["-O2", "-std=c11", "-Wall"],
+    # gnu11 + _GNU_SOURCE: the non-Python TUs (net.c, libpeer.c, ...) need POSIX
+    # symbols that glibc gates behind feature macros under strict c11.
+    extra_compile_args=["-O2", "-std=gnu11", "-D_GNU_SOURCE", "-Wall"],
 )
 
 setup(

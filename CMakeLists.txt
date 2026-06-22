@@ -3,7 +3,10 @@ project(mux C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_C_EXTENSIONS OFF)
+# gnu11 (not strict c11): glibc gates POSIX symbols (CLOCK_MONOTONIC, getaddrinfo,
+# strdup, ...) behind feature macros under -std=c11. Apple libc exposes them
+# anyway, so strict c11 builds on macOS but breaks on Linux. gnu11 works on both.
+set(CMAKE_C_EXTENSIONS ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  # for clangd / IDE
 
 if(NOT CMAKE_BUILD_TYPE)

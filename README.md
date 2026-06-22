@@ -121,6 +121,22 @@ N-replicas-one-socket-each deployment.
 
 > macOS note: port 5000 is taken by AirPlay; the demo uses 15000/15001.
 
+### Docker
+
+One multi-stage image builds `edge`, `edge-peer`, `http_worker` and the
+`muxpeer` Python module; the command picks the role. Inside Linux containers the
+relay uses `epoll`.
+
+```sh
+MUX_TOKEN=s3cr3t docker compose -f deploy/docker-compose.yml up --build
+curl localhost:8080/        # -> handled by one of four python workers
+```
+
+`docker-compose.yml` runs a public **edge** container and a **backend** container
+whose `supervisord` (see `deploy/supervisord.docker.conf`) launches four worker
+replicas — each binding its own `/run/mux/app_NN.sock` — plus the `edge-peer`
+that dials the edge and those sockets.
+
 ## Status
 
 | Piece | State |
