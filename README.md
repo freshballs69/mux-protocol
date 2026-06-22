@@ -76,43 +76,68 @@ Notable design decisions (some deliberately diverge from `MUX.md`):
 - **Zero-copy payload views.** `STREAM_DATA`/`STREAM_OPENED` point into the recv
   buffer and are valid until the next `mux_recv`.
 
-## Running it
+## Topology
 
-A complete proxy: `client → edge:accept-port → mux tunnel → edge-peer → backend`.
-
-```sh
-# backend (anything TCP; here a static file server)
-python3 -m http.server 18080
-
-# edge: public on :5000, uplink listener on :5001
-./build/edge --accept-port 5000 --mux-port 5001 --token s3cr3t
-
-# edge-peer: dials the edge, forwards each stream to the backend
-./build/edge-peer --connect 127.0.0.1:5001 --backend 127.0.0.1:18080 --token s3cr3t
-
-curl http://127.0.0.1:5000/        # flows through the mux to the backend
+```
+client ─▶ edge :accept-port ──mux tunnel──▶ edge-peer ──┬─▶ worker (libpeer) weight 1
+          (public, terminates             (router,      ├─▶ worker (libpeer) weight 3
+           public sockets)                 SWRR balance) └─▶ worker (libpeer) ...
 ```
 
-The pre-shared `--token` (or `MUX_TOKEN` env) is proven on both ends via
-HMAC-SHA256 over the peer's HELLO nonce. Verified end-to-end: 4 MiB and 8
-concurrent transfers are byte-perfect under ASan/UBSan.
+- **edge** terminates public TCP and opens one logical stream per connection
+  over the uplink tunnel. It is the stream initiator.
+- **edge-peer** dials the edge (upstream) and a pool of workers (downstream),
+  SWRR-balancing each inbound stream onto a worker by advertised weight and
+  splicing stream↔stream with flow-control-coupled backpressure.
+- **workers** embed `libpeer` (or the Python `muxpeer` binding) and terminate
+  streams as socket-like conns over ONE tunnel fd — no per-connection fds.
+  Each replica binds its own unix socket (the supervisord/`numprocs` model), so
+  the worker pool is "a global SO_REUSEPORT across machines" with edge-peer
+  doing the weighted balancing.
 
-> macOS note: port 5000 is taken by AirPlay; use another for local testing.
+## Running the demo
+
+```sh
+cmake -S . -B build -G Ninja && cmake --build build
+cd python && uv run --with setuptools python setup.py build_ext --inplace && cd ..
+./deploy/run_demo.sh        # two Python workers (weights 1:3), 40 requests
+# => ~10 handled by PY0, ~30 by PY1
+```
+
+A Python worker is just:
+
+```python
+import muxpeer
+peer = muxpeer.listen("/run/app_00.sock", token="s3cr3t", id="W0", weight=4)
+while (conn := peer.accept()) is not None:
+    conn.recv(65536)                 # request; blocking, releases the GIL
+    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+    conn.close()
+```
+
+The pre-shared `--token` (or `MUX_TOKEN`) is proven on every tunnel via
+HMAC-SHA256 over the peer's HELLO nonce. See `deploy/supervisord.conf` for the
+N-replicas-one-socket-each deployment.
+
+> macOS note: port 5000 is taken by AirPlay; the demo uses 15000/15001.
 
 ## Status
 
-| Milestone | State |
-|-----------|-------|
-| 1. Framing codec + TLV + fuzz | ✅ done |
-| 2. Session state machine | ✅ done |
-| 3. Session-level flow control + memory cap | ✅ done (folded into 2) |
-| —  Adversarial review pass (18 findings fixed) | ✅ done |
-| —  PSK tunnel auth (HMAC-SHA256) | ✅ done |
-| 5. edge daemon (`poll()`) | ✅ done (MVP) |
-| 6. edge-peer (single backend; no SWRR yet) | ✅ done (MVP) |
-| 4. libpeer worker SDK | ⬜ next |
-| 6b. SWRR balancing + multi-worker | ⬜ |
+| Piece | State |
+|-------|-------|
+| 1. Framing codec + TLV + fuzz | ✅ |
+| 2. Session state machine | ✅ |
+| 3. Two-level flow control + memory cap | ✅ |
+| Adversarial review pass (18 findings fixed) | ✅ |
+| PSK tunnel auth (HMAC-SHA256) | ✅ |
+| 4. libpeer worker SDK (blocking, threaded) + unix listen | ✅ |
+| Python `muxpeer` binding | ✅ |
+| 5. edge daemon (`poll()`) | ✅ |
+| 6. edge-peer router + SWRR balancing | ✅ |
+| libpeer event-loop/selector API (`fileno`/`poll`) | ⬜ |
 | 7. TLS/Noise transport wrapper | ⬜ |
+| 8. P2C balancing + global capacity reporting | ⬜ |
+| 9. io_uring/`splice` zero-copy backend | ⬜ |
 
-> Event loop: uses portable `poll()` (runs on Linux and macOS).
-> `epoll`/`io_uring`/`kqueue` + `splice` are a later throughput milestone.
+> Event loop: portable `poll()` (Linux + macOS). `epoll`/`io_uring`/`kqueue` +
+> `splice` are a later throughput milestone.
