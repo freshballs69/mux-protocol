@@ -38,6 +38,10 @@ int net_socket_error(int fd);
 int  net_set_nonblock(int fd);
 int  net_set_nodelay(int fd);
 
+/* Enable TCP keepalive (idle/intvl/cnt in seconds/count) so the kernel reaps a
+ * half-open "zombie" peer. Safe: never fires on a live connection. */
+int  net_set_keepalive(int fd, int idle, int intvl, int cnt);
+
 /* Fill buf with n cryptographically-random bytes. Returns 0 on success. */
 int  os_random(void *buf, size_t n);
 

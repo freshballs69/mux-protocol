@@ -87,6 +87,9 @@ static int run_edge_proc(const edge_cfg *c, long mux_port) {
     while (!g_stop) {
         int uplink = accept_uplink(mux_fd);
         if (uplink < 0) break;
+        /* Keepalive so a zombie edge-peer (vanished with no FIN) is reaped by the
+         * kernel in ~14s; the relay then sees EOF and accepts the next uplink. */
+        net_set_keepalive(uplink, 8, 3, 2);
 
         relay_opts opts;
         memset(&opts, 0, sizeof opts);
@@ -102,6 +105,7 @@ static int run_edge_proc(const edge_cfg *c, long mux_port) {
         if (!r) { close(uplink); continue; }
         relay_run(r);
         relay_free(r);
+        close(uplink);                          /* drop the old uplink fd (no leak) */
         fprintf(stderr, "[edge] uplink gone; awaiting next\n");
     }
 

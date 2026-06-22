@@ -26,6 +26,31 @@ int net_set_nodelay(int fd) {
     return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 }
 
+/* Enable TCP keepalive so the KERNEL reaps a dead peer (a half-open "zombie"
+ * connection left when the peer vanished without a FIN — NAT timeout, host
+ * crash, frozen process). After `idle` seconds idle, probe every `intvl`
+ * seconds; declare dead after `cnt` unanswered probes (~idle + intvl*cnt). The
+ * relay then sees the socket close and accepts a fresh tunnel — no polling, no
+ * preemption, and it can NEVER fire on a live connection. Best-effort; unknown
+ * options are ignored. No-op on AF_UNIX (the setsockopts simply fail). */
+int net_set_keepalive(int fd, int idle, int intvl, int cnt) {
+    int one = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one) < 0) return -1;
+#ifdef TCP_KEEPIDLE
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle);
+#elif defined(TCP_KEEPALIVE)            /* macOS/BSD: idle time, in seconds */
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof idle);
+#endif
+#ifdef TCP_KEEPINTVL
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof intvl);
+#endif
+#ifdef TCP_KEEPCNT
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt);
+#endif
+    (void)intvl; (void)cnt;
+    return 0;
+}
+
 int net_listen(const char *host, uint16_t port, int backlog) {
     char portstr[16];
     snprintf(portstr, sizeof portstr, "%u", (unsigned)port);

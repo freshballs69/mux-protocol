@@ -367,6 +367,7 @@ static void conn_tick_connect(struct ep_state *e, conn_t *c) {
 static void conn_finish_connect(struct ep_state *e, conn_t *c) {
     if (net_socket_error(c->fd) != 0) { close(c->fd); c->fd = -1; c->next_attempt = now_ms()+1000; return; }
     net_set_nonblock(c->fd);
+    net_set_keepalive(c->fd, 8, 3, 2);          /* reap dead edges/workers (~14s) */
     mux_config mc; conn_build_cfg(e, c, &mc);
     c->mux = mux_session_new(&mc, MUX_DIALER);  /* we dial both edge and workers */
     if (!c->mux) { close(c->fd); c->fd = -1; c->next_attempt = now_ms()+1000; return; }
