@@ -34,7 +34,8 @@ static void usage(const char *p) {
     fprintf(stderr,
         "usage: %s --connect EDGE_HOST:PORT [--connect ...] (--worker ADDR ... | --backend HOST:PORT) [--token KEY]\n"
         "  --connect  an edge uplink to dial (repeatable; --edge is an alias).\n"
-        "             Spread ingress across many edge VPSes / reuseport procs.\n"
+        "             Accepts a port range: host:5001..5004 = 4 uplinks (one per\n"
+        "             edge --procs). Spread ingress across VPSes / reuseport procs.\n"
         "  --worker   a worker tunnel to dial (repeatable); unix path or host:port\n"
         "  --backend  OR terminate each stream to this one TCP backend (no balancing)\n"
         "  --token    pre-shared key (or env MUX_TOKEN)\n", p);
@@ -66,6 +67,27 @@ static int run_backend_mode(const char *edge, const char *backend, const char *t
     return 0;
 }
 
+/* Push one --edge arg, expanding a "host:START..END" port range into one edge
+ * per port (e.g. 1.2.3.4:5001..5004 -> :5001,:5002,:5003,:5004). A plain
+ * "host:port" or unix path is pushed as-is. */
+static void add_edge(const char **edges, int *n, int cap, const char *arg) {
+    const char *colon = strrchr(arg, ':');
+    const char *dots  = colon ? strstr(colon, "..") : NULL;
+    if (!dots) { if (*n < cap) edges[(*n)++] = arg; return; }
+
+    char host[256];
+    size_t hlen = (size_t)(colon - arg);
+    if (hlen >= sizeof host) hlen = sizeof host - 1;
+    memcpy(host, arg, hlen); host[hlen] = '\0';
+    long start = strtol(colon + 1, NULL, 10);
+    long end   = strtol(dots + 2, NULL, 10);
+    for (long p = start; p <= end && *n < cap; p++) {
+        char buf[300];
+        snprintf(buf, sizeof buf, "%s:%ld", host, p);
+        edges[(*n)++] = strdup(buf);             /* small, lives for the process */
+    }
+}
+
 int main(int argc, char **argv) {
     const char *backend = NULL, *token = NULL, *peer_id = "edge-peer";
     const char *edges[256]; int nedges = 0;
@@ -73,7 +95,7 @@ int main(int argc, char **argv) {
     long heartbeat = 0;
 
     for (int i = 1; i < argc; i++) {
-        if ((!strcmp(argv[i], "--connect") || !strcmp(argv[i], "--edge")) && i+1<argc) { if (nedges < 256) edges[nedges++] = argv[++i]; }
+        if ((!strcmp(argv[i], "--connect") || !strcmp(argv[i], "--edge")) && i+1<argc) add_edge(edges, &nedges, 256, argv[++i]);
         else if (!strcmp(argv[i], "--worker") && i+1<argc) { if (nworkers < 256) workers[nworkers++] = argv[++i]; }
         else if (!strcmp(argv[i], "--backend") && i+1<argc) backend = argv[++i];
         else if (!strcmp(argv[i], "--token") && i+1<argc) token = argv[++i];
