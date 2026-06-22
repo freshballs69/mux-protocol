@@ -6,3 +6,7 @@ compile_commands.json
 crash-*
 leak-*
 corpus/
+python/build/
+python/*.so
+__pycache__/
+*.egg-info/
