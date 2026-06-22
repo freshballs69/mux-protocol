@@ -14,6 +14,7 @@ import multiprocessing as mp
 import time
 
 REQ = b"GET / HTTP/1.1\r\nHost: bench\r\nConnection: close\r\n\r\n"
+REQ_KA = b"GET / HTTP/1.1\r\nHost: bench\r\n\r\n"   # keep-alive (no close)
 NB = 256  # latency histogram buckets, log scale (factor 2^(1/8))
 
 
@@ -52,19 +53,51 @@ async def _conn_loop(host, port, deadline, hist, count):
             count[1] += 1
 
 
-def _proc(host, port, dur, conc, q):
+async def _conn_loop_ka(host, port, deadline, hist, count):
+    """Keep-alive: one connection, many requests, no per-request connect churn."""
+    try:
+        reader, writer = await asyncio.open_connection(host, port)
+    except Exception:
+        count[1] += 1
+        return
+    while time.monotonic() < deadline:
+        t0 = time.monotonic()
+        try:
+            writer.write(REQ_KA)
+            await writer.drain()
+            headers = await reader.readuntil(b"\r\n\r\n")
+            cl = 0
+            for line in headers.split(b"\r\n"):
+                if line[:15].lower() == b"content-length:":
+                    cl = int(line[15:].strip())
+                    break
+            if cl:
+                await reader.readexactly(cl)
+            count[0] += 1
+            hist[_bucket((time.monotonic() - t0) * 1e6)] += 1
+        except Exception:
+            count[1] += 1
+            break
+    try:
+        writer.close()
+    except Exception:
+        pass
+
+
+def _proc(host, port, dur, conc, q, keepalive):
     try:
         import uvloop
         uvloop.install()
         loopname = "uvloop"
     except Exception:
         loopname = "asyncio"
+    loopfn = _conn_loop_ka if keepalive else _conn_loop
 
     async def run():
         deadline = time.monotonic() + dur
         hist = [0] * NB
         count = [0, 0]                                 # [ok, err]
-        await asyncio.gather(*[_conn_loop(host, port, deadline, hist, count) for _ in range(conc)])
+        await asyncio.gather(*[loopfn(host, port, deadline, hist, count) for _ in range(conc)])
         return count, hist
 
     count, hist = asyncio.run(run())
@@ -77,13 +110,14 @@ def main():
     ap.add_argument("-c", type=int, default=2000, help="total concurrency")
     ap.add_argument("-d", type=int, default=12, help="duration seconds")
     ap.add_argument("-p", type=int, default=mp.cpu_count(), help="processes (cores)")
+    ap.add_argument("--keepalive", action="store_true", help="reuse connections (HTTP keep-alive)")
     a = ap.parse_args()
     host, port = a.target.rsplit(":", 1)
     port = int(port)
     per = max(1, a.c // a.p)
 
     q = mp.Queue()
-    procs = [mp.Process(target=_proc, args=(host, port, a.d, per, q)) for _ in range(a.p)]
+    procs = [mp.Process(target=_proc, args=(host, port, a.d, per, q, a.keepalive)) for _ in range(a.p)]
     t0 = time.monotonic()
     for p in procs:
         p.start()
@@ -111,7 +145,8 @@ def main():
                 return _bucket_ms(b)
         return _bucket_ms(NB - 1)
 
-    print("\n================ loadbench (python/%s) ================" % loopname)
+    print("\n================ loadbench (python/%s, %s) ================"
+          % (loopname, "keep-alive" if a.keepalive else "close-per-req"))
     print("target          %s" % a.target)
     print("processes       %d   concurrency %d (%d/proc)" % (a.p, a.p * per, per))
     print("duration        %.1fs" % secs)

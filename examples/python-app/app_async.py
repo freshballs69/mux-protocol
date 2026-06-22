@@ -34,15 +34,30 @@ WID = "W?"
 
 
 async def handle(conn):
-    await conn.read(65536)                  # read the request (best-effort)
+    # HTTP/1.1 keep-alive: frame requests at the blank line and serve many per
+    # stream, so the mux tunnel is exercised in its steady state (long-lived
+    # streams) instead of being churned open/closed per request. Honors
+    # "Connection: close" for the close-per-request benchmark mode.
     body = f"async hello from {WID} on {socket.gethostname()} (pid {os.getpid()})\n".encode()
-    await conn.write(
-        b"HTTP/1.1 200 OK\r\n"
-        b"Content-Type: text/plain\r\n"
-        b"Content-Length: %d\r\n"
-        b"Connection: close\r\n\r\n" % len(body)
-        + body
-    )
+    buf = bytearray()
+    while True:
+        while b"\r\n\r\n" not in buf:
+            chunk = await conn.read(65536)
+            if not chunk:
+                conn.close()
+                return
+            buf += chunk
+        idx = buf.index(b"\r\n\r\n") + 4
+        req = bytes(buf[:idx]); del buf[:idx]
+        close = b"connection: close" in req.lower()
+        hdr = (b"Connection: close\r\n" if close else b"")
+        await conn.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+            b"Content-Length: %d\r\n%s\r\n%s" % (len(body), hdr, body)
+        )
+        if close:
+            break
+    conn.close()
 
 
 async def main():
