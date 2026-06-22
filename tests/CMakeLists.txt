@@ -4,6 +4,10 @@ add_executable(test_frame test_frame.c)
 target_link_libraries(test_frame PRIVATE mux)
 add_test(NAME frame COMMAND test_frame)
 
+add_executable(test_session test_session.c)
+target_link_libraries(test_session PRIVATE mux)
+add_test(NAME session COMMAND test_session)
+
 # ---- fuzz targets ----
 # Prefer real coverage-guided libFuzzer when the toolchain ships it
 # (mainline clang / brew llvm). Fall back to the portable standalone driver

@@ -55,12 +55,24 @@ enum mux_flag {
 
 /* Control-plane TLV types (payload of HELLO/HELLO_ACK/CAPACITY). */
 enum mux_tlv_type {
-    MUX_TLV_PEER_ID      = 0x0001, /* opaque                                 */
-    MUX_TLV_WEIGHT       = 0x0002, /* u32 advertised balancing weight        */
-    MUX_TLV_MAX_STREAMS  = 0x0003, /* u32 concurrency cap                    */
-    MUX_TLV_AUTH         = 0x0004, /* HMAC(token, session_nonce)             */
-    MUX_TLV_INIT_WINDOW  = 0x0005, /* u32 per-stream initial window          */
-    MUX_TLV_HEARTBEAT_MS = 0x0006  /* u32                                    */
+    MUX_TLV_PEER_ID        = 0x0001, /* opaque                               */
+    MUX_TLV_WEIGHT         = 0x0002, /* u32 advertised balancing weight      */
+    MUX_TLV_MAX_STREAMS    = 0x0003, /* u32 concurrency cap                  */
+    MUX_TLV_AUTH           = 0x0004, /* opaque HMAC(token, nonce) blob       */
+    MUX_TLV_INIT_WINDOW    = 0x0005, /* u32 per-stream initial window        */
+    MUX_TLV_HEARTBEAT_MS   = 0x0006, /* u32                                  */
+    MUX_TLV_SESSION_WINDOW = 0x0007, /* u32 connection-level initial window  */
+    MUX_TLV_NONCE          = 0x0008  /* opaque challenge nonce               */
+};
+
+/* GOAWAY reasons and RST/stream error codes (shared space). */
+enum mux_code {
+    MUX_CODE_NO_ERROR      = 0,
+    MUX_CODE_PROTOCOL      = 1, /* malformed/illegal frame for the state     */
+    MUX_CODE_FLOW_CONTROL  = 2, /* peer exceeded an advertised window        */
+    MUX_CODE_STREAM_LIMIT  = 3, /* MAX_STREAMS exceeded                      */
+    MUX_CODE_INTERNAL      = 4, /* local failure (e.g. out of stream slots)  */
+    MUX_CODE_REFUSED       = 5  /* stream refused (e.g. after GOAWAY)        */
 };
 
 /* ------------------------------------------------------------------ */
@@ -76,7 +88,10 @@ enum mux_err {
     MUX_ERR_SHORT   = -1, /* truncated input; need more bytes (not fatal)   */
     MUX_ERR_PROTO   = -2, /* protocol violation: bad version / oversized    */
     MUX_ERR_NOSPACE = -3, /* destination buffer too small                   */
-    MUX_ERR_PARAM   = -4  /* invalid argument                               */
+    MUX_ERR_PARAM   = -4, /* invalid argument                               */
+    MUX_ERR_STATE   = -5, /* operation illegal in the current state         */
+    MUX_ERR_NOMEM   = -6, /* allocation failed / stream-table full          */
+    MUX_ERR_NOSTREAM= -7  /* referenced stream id does not exist            */
 };
 
 /* ------------------------------------------------------------------ */
@@ -135,6 +150,149 @@ int mux_tlv_put(uint8_t *buf, size_t cap, size_t off, uint16_t t,
  * `*val` is a view into `buf`. */
 int mux_tlv_next(const uint8_t *buf, size_t len, size_t *cursor,
                  uint16_t *t, const uint8_t **val, uint16_t *vlen);
+
+/* ================================================================== */
+/* Session state machine (sans-io)                                    */
+/* ================================================================== */
+/*
+ * A `mux_session` is a pure state machine over one transport byte stream.
+ * It owns no sockets and no clock. The host loop drives it:
+ *
+ *   recv path:   socket -> mux_recv() -> drain mux_next_event()
+ *   send path:   mux_open/write/close/... -> mux_send_buf()/advance() -> socket
+ *   time path:   mux_on_timer(now_ms) on the returned deadline
+ *
+ * Lifetime contract for zero-copy views: STREAM_DATA/STREAM_OPENED events
+ * carry pointers INTO the buffer most recently passed to mux_recv(). They
+ * are valid only until the next mux_recv() (or mux_session_free). Drain all
+ * events for a recv before issuing the next recv; copy out anything kept.
+ */
+
+#define MUX_DEFAULT_INIT_WINDOW    (256u * 1024u)        /* per-stream      */
+#define MUX_DEFAULT_SESSION_WINDOW (16u * 1024u * 1024u) /* connection      */
+#define MUX_DEFAULT_MAX_STREAMS    65536u
+#define MUX_DEFAULT_HEARTBEAT_MS   15000u
+/* DATA writes are chunked into frames no larger than this so large writes
+ * still interleave fairly with other streams' frames. */
+#define MUX_MAX_DATA_FRAME         (64u * 1024u)
+
+/* Role fixes stream-id parity and who sends HELLO vs HELLO_ACK. It follows
+ * the TCP dial direction and is independent of who opens logical streams:
+ * the dialer uses odd ids and greets first; the acceptor uses even ids. */
+typedef enum {
+    MUX_DIALER   = 0,
+    MUX_ACCEPTOR = 1
+} mux_role;
+
+/* Static per-session configuration. Zeroed fields take the documented
+ * default. Pointer fields are copied into the session at creation, so the
+ * caller need not keep them alive afterwards. */
+typedef struct {
+    uint32_t init_window;     /* our per-stream recv window  (0 => default) */
+    uint32_t session_window;  /* our connection recv window  (0 => default) */
+    uint32_t max_streams;     /* our concurrency cap         (0 => default) */
+    uint32_t heartbeat_ms;    /* PING interval; 0 disables keepalive        */
+    uint32_t keepalive_timeout_ms; /* dead if no echo within (0 => 3x hb)   */
+    uint32_t weight;          /* advertised balancing weight                */
+
+    const uint8_t *peer_id;   size_t peer_id_len;   /* opaque identity      */
+    const uint8_t *auth;      size_t auth_len;      /* opaque AUTH blob      */
+    const uint8_t *nonce;     size_t nonce_len;     /* opaque challenge      */
+} mux_config;
+
+typedef struct mux_session mux_session;
+
+/* Event types surfaced by mux_next_event. */
+typedef enum {
+    MUX_EV_NONE = 0,
+    MUX_EV_STREAM_OPENED, /* peer opened a stream (SYN); u.opened carries meta */
+    MUX_EV_STREAM_DATA,   /* stream bytes; u.data is a zero-copy recv view     */
+    MUX_EV_STREAM_CLOSED, /* peer half-closed (FIN); no more inbound data      */
+    MUX_EV_STREAM_RESET,  /* stream aborted (RST); u.reset.code                */
+    MUX_EV_WRITABLE,      /* send window reopened; retry writes. sid 0 = session*/
+    MUX_EV_PEER_HELLO,    /* handshake parameters from peer; u.hello           */
+    MUX_EV_CAPACITY,      /* peer weight changed; u.capacity (0 = draining)    */
+    MUX_EV_GOAWAY,        /* peer is draining; u.goaway                        */
+    MUX_EV_FATAL          /* session is dead; u.fatal.code. Tear down.         */
+} mux_event_type;
+
+typedef struct {
+    mux_event_type type;
+    uint32_t       sid;
+    union {
+        struct { const uint8_t *meta; size_t meta_len; } opened;
+        struct { const uint8_t *data; size_t data_len; } data;
+        struct { uint32_t code; } reset;
+        struct {
+            uint32_t       weight;
+            uint32_t       max_streams;
+            uint32_t       init_window;
+            const uint8_t *peer_id; size_t peer_id_len;
+            const uint8_t *auth;    size_t auth_len;
+            const uint8_t *nonce;   size_t nonce_len;
+        } hello;
+        struct { uint32_t weight; } capacity;
+        struct { uint32_t reason; uint32_t last_sid; } goaway;
+        struct { uint32_t code; } fatal;
+    } u;
+} mux_event;
+
+/* Create/destroy. Returns NULL on allocation failure or bad config. */
+mux_session *mux_session_new(const mux_config *cfg, mux_role role);
+void         mux_session_free(mux_session *s);
+
+/* Feed transport bytes. Parses as many whole frames as present, applying
+ * state transitions and queueing events. Returns the number of bytes
+ * consumed (>= 0; a trailing partial frame is left unconsumed for the next
+ * call) or a negative code. A protocol violation queues MUX_EV_FATAL and
+ * returns the bytes consumed up to the offending frame. */
+int mux_recv(mux_session *s, const uint8_t *buf, size_t len);
+
+/* Open a new outbound stream carrying optional metadata (the SYN payload,
+ * e.g. PROXY-protocol TLVs). Returns the new stream id (>= 1) or a negative
+ * code (MUX_ERR_STATE before handshake, MUX_ERR_NOMEM at the stream cap). */
+int64_t mux_open(mux_session *s, const uint8_t *meta, size_t meta_len);
+
+/* Queue up to n bytes of stream data, bounded by the per-stream AND the
+ * connection send windows. Returns bytes actually accepted (0..n); 0 means
+ * the stream is window-blocked — wait for MUX_EV_WRITABLE. Negative on error
+ * (e.g. MUX_ERR_STATE after local FIN, MUX_ERR_NOSTREAM). */
+int64_t mux_write(mux_session *s, uint32_t sid, const uint8_t *p, size_t n);
+
+/* Half-close the local send direction (FIN). The stream stays readable
+ * until the peer also FINs. Idempotent. */
+int mux_close(mux_session *s, uint32_t sid);
+
+/* Abort a stream now (RST). Frees state immediately. */
+int mux_reset(mux_session *s, uint32_t sid, uint32_t code);
+
+/* Tell the core the application consumed n received bytes on a stream, so
+ * it can credit the peer via WINDOW_UPDATE (batched at the half-window
+ * watermark). Drives both per-stream and connection-level flow control. */
+int mux_consume(mux_session *s, uint32_t sid, size_t n);
+
+/* Advertise a new balancing weight to the peer (CAPACITY frame). weight 0
+ * signals draining. */
+int mux_send_capacity(mux_session *s, uint32_t weight);
+
+/* Begin graceful drain: emit GOAWAY(reason) with the highest stream id we
+ * have processed. After this, mux_open is refused locally. */
+int mux_goaway(mux_session *s, uint32_t reason);
+
+/* Advance time. Sends keepalive PINGs and detects a dead peer (queueing
+ * MUX_EV_FATAL). Returns the absolute ms of the next deadline at which the
+ * caller should invoke this again, or UINT64_MAX if no timer is armed. */
+uint64_t mux_on_timer(mux_session *s, uint64_t now_ms);
+
+/* Pending outbound bytes as a contiguous zero-copy view. Write them to the
+ * transport, then call mux_send_advance with however many were accepted.
+ * *len is set to the byte count (0 if nothing pending). */
+const uint8_t *mux_send_buf(mux_session *s, size_t *len);
+void           mux_send_advance(mux_session *s, size_t n);
+
+/* Pop the next queued event into *ev. Returns 1 if one was written, 0 if
+ * the queue is empty. */
+int mux_next_event(mux_session *s, mux_event *ev);
 
 #ifdef __cplusplus
 }

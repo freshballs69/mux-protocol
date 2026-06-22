@@ -22,6 +22,7 @@ endif()
 # ---- libmux core ----
 add_library(mux STATIC
   libmux/src/frame.c
+  libmux/src/session.c
 )
 target_include_directories(mux PUBLIC libmux/include)
 
