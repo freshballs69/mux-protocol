@@ -26,6 +26,12 @@ add_library(mux STATIC
 )
 target_include_directories(mux PUBLIC libmux/include)
 
+# ---- common: daemon-side helpers (auth, etc.) ----
+add_library(muxcommon STATIC
+  common/auth.c
+)
+target_include_directories(muxcommon PUBLIC common)
+
 # ---- tests ----
 enable_testing()
 add_subdirectory(tests)

@@ -8,6 +8,10 @@ add_executable(test_session test_session.c)
 target_link_libraries(test_session PRIVATE mux)
 add_test(NAME session COMMAND test_session)
 
+add_executable(test_auth test_auth.c)
+target_link_libraries(test_auth PRIVATE muxcommon)
+add_test(NAME auth COMMAND test_auth)
+
 # ---- fuzz targets ----
 # Prefer real coverage-guided libFuzzer when the toolchain ships it
 # (mainline clang / brew llvm). Fall back to the portable standalone driver
