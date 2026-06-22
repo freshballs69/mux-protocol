@@ -40,6 +40,14 @@ add_library(muxrelay STATIC
 target_include_directories(muxrelay PUBLIC common)
 target_link_libraries(muxrelay PUBLIC mux muxcommon)
 
+# ---- libpeer: worker SDK (blocking facade + background I/O thread) ----
+find_package(Threads REQUIRED)
+add_library(peer STATIC
+  libpeer/src/libpeer.c
+)
+target_include_directories(peer PUBLIC libpeer/include)
+target_link_libraries(peer PUBLIC mux muxcommon Threads::Threads)
+
 # ---- daemons ----
 add_executable(edge      edge/main.c)
 target_link_libraries(edge PRIVATE muxrelay)

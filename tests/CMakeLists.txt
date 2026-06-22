@@ -12,6 +12,11 @@ add_executable(test_auth test_auth.c)
 target_link_libraries(test_auth PRIVATE muxcommon)
 add_test(NAME auth COMMAND test_auth)
 
+add_executable(test_libpeer test_libpeer.c)
+target_link_libraries(test_libpeer PRIVATE peer mux muxcommon)
+add_test(NAME libpeer COMMAND test_libpeer)
+set_tests_properties(libpeer PROPERTIES TIMEOUT 30)
+
 # ---- fuzz targets ----
 # Prefer real coverage-guided libFuzzer when the toolchain ships it
 # (mainline clang / brew llvm). Fall back to the portable standalone driver
