@@ -1,12 +1,15 @@
 /build/
+/build-rel/
+build/
+dist/
 compile_commands.json
 *.o
 *.a
+*.so
 .DS_Store
 crash-*
 leak-*
 corpus/
 python/build/
-python/*.so
 __pycache__/
 *.egg-info/

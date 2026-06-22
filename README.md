@@ -119,6 +119,27 @@ The pre-shared `--token` (or `MUX_TOKEN`) is proven on every tunnel via
 HMAC-SHA256 over the peer's HELLO nonce. See `deploy/supervisord.conf` for the
 N-replicas-one-socket-each deployment.
 
+### Install the worker SDK via pip
+
+The `muxpeer` binding + `muxpeer_aio` asyncio adapter are pip-installable; the C
+extension compiles at install time against whatever Python you run, so any
+project can depend on it:
+
+```sh
+pip install "git+https://github.com/freshballs69/mux-protocol.git"
+```
+
+```python
+import asyncio, muxpeer
+from muxpeer_aio import serve            # async adapter: one stream -> await read/write
+
+async def handle(conn):
+    await conn.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+    conn.close()
+
+asyncio.run(serve(muxpeer.listen("/run/app.sock", token="KEY", id="W0"), handle))
+```
+
 > macOS note: port 5000 is taken by AirPlay; the demo uses 15000/15001.
 
 ### Docker

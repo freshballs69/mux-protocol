@@ -32,8 +32,9 @@ static void on_sigint(int sig){ (void)sig; g_stop = 1; ep_request_stop(); relay_
 
 static void usage(const char *p) {
     fprintf(stderr,
-        "usage: %s --connect EDGE_HOST:PORT (--worker ADDR ... | --backend HOST:PORT) [--token KEY]\n"
-        "  --connect  edge uplink to dial\n"
+        "usage: %s --connect EDGE_HOST:PORT [--connect ...] (--worker ADDR ... | --backend HOST:PORT) [--token KEY]\n"
+        "  --connect  an edge uplink to dial (repeatable; --edge is an alias).\n"
+        "             Spread ingress across many edge VPSes / reuseport procs.\n"
         "  --worker   a worker tunnel to dial (repeatable); unix path or host:port\n"
         "  --backend  OR terminate each stream to this one TCP backend (no balancing)\n"
         "  --token    pre-shared key (or env MUX_TOKEN)\n", p);
@@ -66,12 +67,13 @@ static int run_backend_mode(const char *edge, const char *backend, const char *t
 }
 
 int main(int argc, char **argv) {
-    const char *connect_addr = NULL, *backend = NULL, *token = NULL, *peer_id = "edge-peer";
+    const char *backend = NULL, *token = NULL, *peer_id = "edge-peer";
+    const char *edges[256]; int nedges = 0;
     const char *workers[256]; int nworkers = 0;
     long heartbeat = 0;
 
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--connect") && i+1<argc) connect_addr = argv[++i];
+        if ((!strcmp(argv[i], "--connect") || !strcmp(argv[i], "--edge")) && i+1<argc) { if (nedges < 256) edges[nedges++] = argv[++i]; }
         else if (!strcmp(argv[i], "--worker") && i+1<argc) { if (nworkers < 256) workers[nworkers++] = argv[++i]; }
         else if (!strcmp(argv[i], "--backend") && i+1<argc) backend = argv[++i];
         else if (!strcmp(argv[i], "--token") && i+1<argc) token = argv[++i];
@@ -80,17 +82,17 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
         else { fprintf(stderr, "unknown arg: %s\n", argv[i]); usage(argv[0]); return 2; }
     }
-    if (!connect_addr || (nworkers == 0 && !backend)) { usage(argv[0]); return 2; }
+    if (nedges == 0 || (nworkers == 0 && !backend)) { usage(argv[0]); return 2; }
     if (!token) token = getenv("MUX_TOKEN");
 
     signal(SIGINT, on_sigint); signal(SIGTERM, on_sigint); signal(SIGPIPE, SIG_IGN);
     net_raise_fd_limit();
 
     if (backend && nworkers == 0)
-        return run_backend_mode(connect_addr, backend, token);
+        return run_backend_mode(edges[0], backend, token);  /* relay mode: single edge */
 
     ep_config cfg; memset(&cfg, 0, sizeof cfg);
-    cfg.edge_addr = connect_addr;
+    cfg.edges = edges; cfg.nedges = nedges;
     cfg.workers = workers; cfg.nworkers = nworkers;
     cfg.token = token; cfg.peer_id = peer_id;
     cfg.heartbeat_ms = (uint32_t)heartbeat;

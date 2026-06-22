@@ -21,9 +21,12 @@ try:
 except Exception:                            # noqa: BLE001
     _LOOP = "asyncio"
 
-# Find muxpeer_aio next to us (container) or in the repo's python/ dir (native).
+# Find the muxpeer extension + muxpeer_aio: next to us (container copies both
+# here) or in the repo (native: the .so is built into python/, muxpeer_aio.py is
+# at the repo root). Unnecessary once `pip install muxpeer` puts both on the path.
 _HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (_HERE, os.path.join(_HERE, "..", "..", "python")):
+_ROOT = os.path.join(_HERE, "..", "..")
+for _p in (_HERE, _ROOT, os.path.join(_ROOT, "python")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 

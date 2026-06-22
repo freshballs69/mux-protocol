@@ -7,7 +7,8 @@
 #include <stdint.h>
 
 typedef struct {
-    const char  *edge_addr;     /* upstream edge to dial ("host:port")        */
+    const char **edges;         /* upstream edges to dial ("host:port")       */
+    int          nedges;
     const char **workers;       /* worker addresses ("host:port" or unix path)*/
     int          nworkers;
     const char  *token;

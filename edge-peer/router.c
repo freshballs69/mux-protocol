@@ -59,13 +59,16 @@ typedef struct {
     uint32_t weight;            /* advertised; 0 = draining/unknown        */
     long     swrr_cw;           /* SWRR current weight                     */
     uint32_t inflight;
-    umap     down;              /* down_sid -> route*                      */
+    umap     routes;            /* sid -> route* (up_sid for an edge,      */
+                                /* down_sid for a worker)                  */
+    int      is_edge;           /* this tunnel is an upstream edge          */
 
     uint8_t  nonce[16], proof[32];
 } conn_t;
 
-/* ---- a spliced stream pair ---- */
+/* ---- a spliced stream pair (one upstream edge <-> one worker) ---- */
 typedef struct {
+    int      edge_idx;          /* which upstream edge owns up_sid          */
     uint32_t up_sid;
     int      worker_idx;
     uint32_t down_sid;
@@ -76,9 +79,8 @@ typedef struct {
 
 struct ep_state {
     ep_config cfg;
-    conn_t    up;               /* upstream edge tunnel                   */
-    conn_t   *wk; int nwk;      /* worker pool                            */
-    umap      up_routes;        /* up_sid -> route*                       */
+    conn_t   *edges; int nedges; /* upstream edge tunnels                  */
+    conn_t   *wk; int nwk;       /* worker pool                            */
 };
 
 static volatile int g_stop = 0;
@@ -122,19 +124,20 @@ static int pick_worker(struct ep_state *e) {
 }
 
 /* ============================ routes ============================ */
-static route *route_new(struct ep_state *e, uint32_t up_sid, int widx, uint32_t down_sid) {
+static route *route_new(struct ep_state *e, int eidx, uint32_t up_sid, int widx, uint32_t down_sid) {
     route *r = calloc(1, sizeof *r);
     if (!r) return NULL;
-    r->up_sid = up_sid; r->worker_idx = widx; r->down_sid = down_sid;
-    umap_put(&e->up_routes, up_sid, r);
-    umap_put(&e->wk[widx].down, down_sid, r);
+    r->edge_idx = eidx; r->up_sid = up_sid; r->worker_idx = widx; r->down_sid = down_sid;
+    umap_put(&e->edges[eidx].routes, up_sid, r);
+    umap_put(&e->wk[widx].routes, down_sid, r);
     e->wk[widx].inflight++;
     return r;
 }
 static void route_free(struct ep_state *e, route *r) {
-    umap_del(&e->up_routes, r->up_sid);
+    if (r->edge_idx >= 0 && r->edge_idx < e->nedges)
+        umap_del(&e->edges[r->edge_idx].routes, r->up_sid);
     if (r->worker_idx >= 0 && r->worker_idx < e->nwk) {
-        umap_del(&e->wk[r->worker_idx].down, r->down_sid);
+        umap_del(&e->wk[r->worker_idx].routes, r->down_sid);
         if (e->wk[r->worker_idx].inflight) e->wk[r->worker_idx].inflight--;
     }
     buf_free(&r->u2w); buf_free(&r->w2u);
@@ -165,54 +168,56 @@ static void flush_pend(mux_session *src, uint32_t src_sid, mux_session *dst, uin
 static void route_kill(struct ep_state *e, route *r, int rst_up, int rst_down) {
     if (r->gone) return;
     r->gone = 1;
-    if (rst_up && e->up.mux) mux_reset(e->up.mux, r->up_sid, MUX_CODE_INTERNAL);
+    if (rst_up && r->edge_idx >= 0 && r->edge_idx < e->nedges && e->edges[r->edge_idx].mux)
+        mux_reset(e->edges[r->edge_idx].mux, r->up_sid, MUX_CODE_INTERNAL);
     if (rst_down && r->worker_idx >= 0 && e->wk[r->worker_idx].mux)
         mux_reset(e->wk[r->worker_idx].mux, r->down_sid, MUX_CODE_INTERNAL);
     route_free(e, r);
 }
 
 /* ============================ event handling ============================ */
-static void on_up_events(struct ep_state *e) {
+static void on_up_events(struct ep_state *e, conn_t *ed) {
+    int eidx = ed->idx;
     mux_event ev;
-    while (mux_next_event(e->up.mux, &ev)) {
+    while (mux_next_event(ed->mux, &ev)) {
         switch (ev.type) {
         case MUX_EV_PEER_HELLO:
-            if (!check_auth(e, &ev)) { fprintf(stderr,"[ep] edge AUTH FAILED\n"); mux_goaway(e->up.mux, MUX_CODE_REFUSED); }
-            else { e->up.ready = 1; fprintf(stderr,"[ep] edge tunnel up\n"); }
+            if (!check_auth(e, &ev)) { fprintf(stderr,"[ep] edge %d AUTH FAILED\n", eidx); mux_goaway(ed->mux, MUX_CODE_REFUSED); }
+            else { ed->ready = 1; fprintf(stderr,"[ep] edge %d tunnel up (%s)\n", eidx, ed->addr); }
             break;
         case MUX_EV_STREAM_OPENED: {
             int widx = pick_worker(e);
-            if (widx < 0) { mux_reset(e->up.mux, ev.sid, MUX_CODE_REFUSED); break; } /* no worker */
+            if (widx < 0) { mux_reset(ed->mux, ev.sid, MUX_CODE_REFUSED); break; } /* no worker */
             int64_t ds = mux_open(e->wk[widx].mux, ev.u.opened.meta, ev.u.opened.meta_len);
-            if (ds < 0) { mux_reset(e->up.mux, ev.sid, MUX_CODE_REFUSED); break; }
-            route *r = route_new(e, ev.sid, widx, (uint32_t)ds);
-            if (!r) { mux_reset(e->up.mux, ev.sid, MUX_CODE_INTERNAL); mux_reset(e->wk[widx].mux,(uint32_t)ds,MUX_CODE_INTERNAL); }
+            if (ds < 0) { mux_reset(ed->mux, ev.sid, MUX_CODE_REFUSED); break; }
+            route *r = route_new(e, eidx, ev.sid, widx, (uint32_t)ds);
+            if (!r) { mux_reset(ed->mux, ev.sid, MUX_CODE_INTERNAL); mux_reset(e->wk[widx].mux,(uint32_t)ds,MUX_CODE_INTERNAL); }
             break;
         }
         case MUX_EV_STREAM_DATA: {
-            route *r = umap_get(&e->up_routes, ev.sid);
+            route *r = umap_get(&ed->routes, ev.sid);
             if (!r || r->worker_idx < 0) break;
-            fwd(e->up.mux, r->up_sid, e->wk[r->worker_idx].mux, r->down_sid, &r->u2w,
+            fwd(ed->mux, r->up_sid, e->wk[r->worker_idx].mux, r->down_sid, &r->u2w,
                 ev.u.data.data, ev.u.data.data_len);
             break;
         }
         case MUX_EV_WRITABLE: {              /* upstream send window reopened */
-            route *r = umap_get(&e->up_routes, ev.sid);
+            route *r = umap_get(&ed->routes, ev.sid);
             if (r && r->worker_idx >= 0)
-                flush_pend(e->wk[r->worker_idx].mux, r->down_sid, e->up.mux, r->up_sid, &r->w2u);
+                flush_pend(e->wk[r->worker_idx].mux, r->down_sid, ed->mux, r->up_sid, &r->w2u);
             break;
         }
         case MUX_EV_STREAM_CLOSED: {
-            route *r = umap_get(&e->up_routes, ev.sid);
+            route *r = umap_get(&ed->routes, ev.sid);
             if (!r || r->worker_idx < 0) break;
-            flush_pend(e->up.mux, r->up_sid, e->wk[r->worker_idx].mux, r->down_sid, &r->u2w);
+            flush_pend(ed->mux, r->up_sid, e->wk[r->worker_idx].mux, r->down_sid, &r->u2w);
             mux_close(e->wk[r->worker_idx].mux, r->down_sid);
             r->up_fin = 1;
             if (r->down_fin) route_free(e, r);
             break;
         }
         case MUX_EV_STREAM_RESET: {
-            route *r = umap_get(&e->up_routes, ev.sid);
+            route *r = umap_get(&ed->routes, ev.sid);
             if (r) route_kill(e, r, 0, 1);
             break;
         }
@@ -236,27 +241,30 @@ static void on_worker_events(struct ep_state *e, conn_t *w) {
             fprintf(stderr,"[ep] worker %d weight->%u\n", w->idx, w->weight);
             break;
         case MUX_EV_STREAM_DATA: {
-            route *r = umap_get(&w->down, ev.sid);
-            if (!r) break;
-            fwd(w->mux, r->down_sid, e->up.mux, r->up_sid, &r->w2u, ev.u.data.data, ev.u.data.data_len);
+            route *r = umap_get(&w->routes, ev.sid);
+            if (!r || r->edge_idx < 0 || r->edge_idx >= e->nedges) break;
+            mux_session *up = e->edges[r->edge_idx].mux; if (!up) break;
+            fwd(w->mux, r->down_sid, up, r->up_sid, &r->w2u, ev.u.data.data, ev.u.data.data_len);
             break;
         }
         case MUX_EV_WRITABLE: {               /* worker send window reopened */
-            route *r = umap_get(&w->down, ev.sid);
-            if (r) flush_pend(e->up.mux, r->up_sid, w->mux, r->down_sid, &r->u2w);
+            route *r = umap_get(&w->routes, ev.sid);
+            if (r && r->edge_idx >= 0 && r->edge_idx < e->nedges && e->edges[r->edge_idx].mux)
+                flush_pend(e->edges[r->edge_idx].mux, r->up_sid, w->mux, r->down_sid, &r->u2w);
             break;
         }
         case MUX_EV_STREAM_CLOSED: {
-            route *r = umap_get(&w->down, ev.sid);
-            if (!r) break;
-            flush_pend(w->mux, r->down_sid, e->up.mux, r->up_sid, &r->w2u);
-            mux_close(e->up.mux, r->up_sid);
+            route *r = umap_get(&w->routes, ev.sid);
+            if (!r || r->edge_idx < 0 || r->edge_idx >= e->nedges) break;
+            mux_session *up = e->edges[r->edge_idx].mux; if (!up) break;
+            flush_pend(w->mux, r->down_sid, up, r->up_sid, &r->w2u);
+            mux_close(up, r->up_sid);
             r->down_fin = 1;
             if (r->up_fin) route_free(e, r);
             break;
         }
         case MUX_EV_STREAM_RESET: {
-            route *r = umap_get(&w->down, ev.sid);
+            route *r = umap_get(&w->routes, ev.sid);
             if (r) route_kill(e, r, 1, 0);
             break;
         }
@@ -271,15 +279,32 @@ static void on_worker_events(struct ep_state *e, conn_t *w) {
 
 /* RST every route bound to a worker that just died, propagating upstream. */
 static void drop_worker_routes(struct ep_state *e, conn_t *w) {
-    for (size_t i = 0; i < w->down.cap; i++) {
-        if (!w->down.s[i].used) continue;
-        route *r = (route *)w->down.s[i].v;
-        if (r && !r->gone && e->up.mux) mux_reset(e->up.mux, r->up_sid, MUX_CODE_INTERNAL);
+    for (size_t i = 0; i < w->routes.cap; i++) {
+        if (!w->routes.s[i].used) continue;
+        route *r = (route *)w->routes.s[i].v;
+        if (r && !r->gone && r->edge_idx >= 0 && r->edge_idx < e->nedges && e->edges[r->edge_idx].mux)
+            mux_reset(e->edges[r->edge_idx].mux, r->up_sid, MUX_CODE_INTERNAL);
     }
     /* free them (clears both maps) */
     for (;;) {
         route *r = NULL;
-        for (size_t i = 0; i < w->down.cap; i++) if (w->down.s[i].used) { r = w->down.s[i].v; break; }
+        for (size_t i = 0; i < w->routes.cap; i++) if (w->routes.s[i].used) { r = w->routes.s[i].v; break; }
+        if (!r) break;
+        r->gone = 1; route_free(e, r);
+    }
+}
+
+/* RST every route bound to an edge that just died, propagating downstream. */
+static void drop_edge_routes(struct ep_state *e, conn_t *ed) {
+    for (size_t i = 0; i < ed->routes.cap; i++) {
+        if (!ed->routes.s[i].used) continue;
+        route *r = (route *)ed->routes.s[i].v;
+        if (r && !r->gone && r->worker_idx >= 0 && r->worker_idx < e->nwk && e->wk[r->worker_idx].mux)
+            mux_reset(e->wk[r->worker_idx].mux, r->down_sid, MUX_CODE_INTERNAL);
+    }
+    for (;;) {
+        route *r = NULL;
+        for (size_t i = 0; i < ed->routes.cap; i++) if (ed->routes.s[i].used) { r = ed->routes.s[i].v; break; }
         if (!r) break;
         r->gone = 1; route_free(e, r);
     }
@@ -302,7 +327,7 @@ static int conn_read(struct ep_state *e, conn_t *c) {
         size_t space = sizeof c->recv - c->recv_len;
         if (space == 0) {
             int64_t cc = mux_recv(c->mux, c->recv, c->recv_len);
-            if (c->is_worker) on_worker_events(e, c); else on_up_events(e);
+            if (c->is_worker) on_worker_events(e, c); else on_up_events(e, c);
             if (cc < 0) return -1;
             if (cc > 0) { c->recv_len -= (size_t)cc; memmove(c->recv, c->recv+(size_t)cc, c->recv_len); }
             else return 0;
@@ -312,7 +337,7 @@ static int conn_read(struct ep_state *e, conn_t *c) {
         if (n > 0) {
             c->recv_len += (size_t)n;
             int64_t cc = mux_recv(c->mux, c->recv, c->recv_len);
-            if (c->is_worker) on_worker_events(e, c); else on_up_events(e);
+            if (c->is_worker) on_worker_events(e, c); else on_up_events(e, c);
             if (cc < 0) return -1;
             if (cc > 0) { c->recv_len -= (size_t)cc; if (c->recv_len) memmove(c->recv, c->recv+(size_t)cc, c->recv_len); }
             if ((size_t)n < space) return 0;
@@ -323,6 +348,7 @@ static int conn_read(struct ep_state *e, conn_t *c) {
 
 static void conn_teardown(struct ep_state *e, conn_t *c) {
     if (c->is_worker) drop_worker_routes(e, c);
+    else if (c->is_edge) drop_edge_routes(e, c);
     if (c->mux) { mux_session_free(c->mux); c->mux = NULL; }
     if (c->fd >= 0) { close(c->fd); c->fd = -1; }
     c->connecting = 0; c->ready = 0; c->recv_len = 0; c->inflight = 0;
@@ -352,24 +378,25 @@ static void conn_finish_connect(struct ep_state *e, conn_t *c) {
 int ep_run(const ep_config *cfg) {
     struct ep_state E; memset(&E, 0, sizeof E);
     E.cfg = *cfg;
-    E.up.addr = (char*)cfg->edge_addr;
-    E.up.fd = -1;
+    E.nedges = cfg->nedges;
+    E.edges = calloc((size_t)E.nedges, sizeof *E.edges);
+    for (int i = 0; i < E.nedges; i++) { E.edges[i].addr = (char*)cfg->edges[i]; E.edges[i].fd = -1; E.edges[i].is_edge = 1; E.edges[i].idx = i; }
     E.nwk = cfg->nworkers;
     E.wk = calloc((size_t)E.nwk, sizeof *E.wk);
     for (int i = 0; i < E.nwk; i++) { E.wk[i].addr = (char*)cfg->workers[i]; E.wk[i].fd = -1; E.wk[i].is_worker = 1; E.wk[i].idx = i; }
 
-    fprintf(stderr, "[ep] edge=%s workers=%d auth=%s\n", cfg->edge_addr, E.nwk, cfg->token?"on":"OFF");
+    fprintf(stderr, "[ep] edges=%d workers=%d auth=%s\n", E.nedges, E.nwk, cfg->token?"on":"OFF");
 
     struct pollfd *pfd = NULL; conn_t **owner = NULL; size_t pcap = 0;
 
     while (!g_stop) {
-        /* (re)connect any down tunnels */
-        conn_tick_connect(&E, &E.up);
+        /* (re)connect any tunnels */
+        for (int i = 0; i < E.nedges; i++) conn_tick_connect(&E, &E.edges[i]);
         for (int i = 0; i < E.nwk; i++) conn_tick_connect(&E, &E.wk[i]);
 
         /* keepalive + flush */
         uint64_t t = now_ms();
-        if (E.up.mux) { mux_on_timer(E.up.mux, t); on_up_events(&E); conn_flush(&E.up); }
+        for (int i = 0; i < E.nedges; i++) if (E.edges[i].mux) { mux_on_timer(E.edges[i].mux, t); on_up_events(&E, &E.edges[i]); conn_flush(&E.edges[i]); }
         for (int i = 0; i < E.nwk; i++) if (E.wk[i].mux) { mux_on_timer(E.wk[i].mux, t); on_worker_events(&E, &E.wk[i]); conn_flush(&E.wk[i]); }
 
         /* build poll set */
@@ -380,7 +407,7 @@ int ep_run(const ep_config *cfg) {
             if ((C)->connecting) ev = POLLOUT; \
             else { size_t op=(C)->mux?mux_out_pending((C)->mux):0; if (op < (4u<<20)) ev|=POLLIN; if (op) ev|=POLLOUT; } \
             pfd[n].fd=(C)->fd; pfd[n].events=ev; pfd[n].revents=0; owner[n]=(C); n++; } } while(0)
-        ADD(&E.up);
+        for (int i = 0; i < E.nedges; i++) ADD(&E.edges[i]);
         for (int i = 0; i < E.nwk; i++) ADD(&E.wk[i]);
         #undef ADD
 
@@ -395,14 +422,13 @@ int ep_run(const ep_config *cfg) {
             if (c->fd >= 0 && (pfd[i].revents & POLLOUT)) { if (conn_flush(c) < 0) { conn_teardown(&E, c); continue; } }
         }
         /* post-pass flush (routing may have produced output on peer sessions) */
-        if (E.up.mux) conn_flush(&E.up);
+        for (int i = 0; i < E.nedges; i++) if (E.edges[i].mux) conn_flush(&E.edges[i]);
         for (int i = 0; i < E.nwk; i++) if (E.wk[i].mux) conn_flush(&E.wk[i]);
     }
 
     /* teardown */
-    for (int i = 0; i < E.nwk; i++) { conn_teardown(&E, &E.wk[i]); free(E.wk[i].down.s); }
-    conn_teardown(&E, &E.up);
-    free(E.up_routes.s);
-    free(E.wk); free(pfd); free(owner);
+    for (int i = 0; i < E.nwk; i++) { conn_teardown(&E, &E.wk[i]); free(E.wk[i].routes.s); }
+    for (int i = 0; i < E.nedges; i++) { conn_teardown(&E, &E.edges[i]); free(E.edges[i].routes.s); }
+    free(E.edges); free(E.wk); free(pfd); free(owner);
     return 0;
 }

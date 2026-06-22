@@ -1,9 +1,12 @@
 # Worker NODE (runs on the remote box). 16 asyncio+uvloop workers (one per core)
 # + edge-peer that dials the EDGE (on another machine) and all worker sockets.
-# The edge runs elsewhere; set EDGE_ADDR=<edge-host>:<mux-port>.
+# The edge(s) run elsewhere. Set EDGES to one or more --edge flags — one per
+# edge uplink port (across --procs workers and/or multiple edge VPSes):
 #
-#   EDGE_ADDR=192.168.50.109:15001 MUX_TOKEN=s3cr3t \
+#   EDGES="--edge 37.27.93.162:5001 --edge 37.27.93.162:5002" MUX_TOKEN=hello \
 #     docker compose -f deploy/docker-compose.node.yml up --build
+#
+# (Single edge: EDGES="--edge host:5001".)
 services:
   app:
     build:
@@ -23,7 +26,7 @@ services:
   edge-peer:
     image: gig4ch4d/edge-peer:latest
     command: >
-      --connect ${EDGE_ADDR:?set EDGE_ADDR=host:port}
+      ${EDGES:?set EDGES=--edge host:5001 [--edge host:5002 ...]}
       --worker /sockets/w00.sock --worker /sockets/w01.sock
       --worker /sockets/w02.sock --worker /sockets/w03.sock
       --worker /sockets/w04.sock --worker /sockets/w05.sock

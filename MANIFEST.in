@@ -1,0 +1,9 @@
+# Ship the C sources + headers in the sdist so `pip install muxpeer` (from an
+# sdist, not just a git checkout) can compile the extension.
+recursive-include libpeer *.c *.h
+recursive-include libmux *.c *.h
+recursive-include common *.c *.h
+include python/muxpeermodule.c
+include muxpeer_aio.py
+include README.md
+include MUX.md

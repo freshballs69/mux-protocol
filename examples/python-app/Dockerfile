@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends supervisor \
 RUN pip install --no-cache-dir uvloop          # faster asyncio loop for app_async.py
 WORKDIR /app
 COPY --from=builder /src/python/muxpeer*.so /app/
-COPY python/muxpeer_aio.py /app/muxpeer_aio.py
+COPY muxpeer_aio.py /app/muxpeer_aio.py
 COPY examples/python-app/app.py /app/app.py
 COPY examples/python-app/app_async.py /app/app_async.py
 COPY examples/python-app/supervisord.conf /app/supervisord.conf

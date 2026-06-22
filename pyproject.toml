@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "muxpeer"
+version = "0.1.0"
+description = "Worker SDK for the mux protocol — libpeer C binding + asyncio adapter"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Vitalii" }]
+keywords = ["mux", "multiplexer", "tunnel", "proxy", "asyncio"]
+
+# The C extension (muxpeer) is declared in setup.py — setuptools can't express a
+# compiled Extension in pyproject. Everything else (metadata, the pure-python
+# muxpeer_aio adapter) lives here.
+
+[project.urls]
+Homepage = "https://github.com/freshballs69/mux-protocol"
+
+[tool.setuptools]
+# muxpeer_aio.py is a top-level module at the repo root (next to setup.py); the
+# `muxpeer` C extension is declared in setup.py. No package_dir remap — that would
+# shift the base for the extension's C sources too and break the build.
+py-modules = ["muxpeer_aio"]
