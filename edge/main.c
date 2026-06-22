@@ -39,6 +39,9 @@ static void usage(const char *prog) {
         "  --mux-port     uplink listener; an edge-peer dials in here\n"
         "  --procs        fork K workers sharing --accept-port (SO_REUSEPORT) to\n"
         "                 use all cores; worker i listens on uplink --mux-port + i\n"
+        "  --max-streams  per-proc cap on concurrent client conns (default 8000,\n"
+        "                 0 = unlimited); at the cap the edge stops accepting so\n"
+        "                 it sheds load instead of drowning in half-open fds\n"
         "  --token        pre-shared key (or env MUX_TOKEN); omitted = no auth\n",
         prog);
 }
@@ -62,7 +65,7 @@ static int accept_uplink(int mux_fd) {
 
 /* Configuration shared by every worker (only mux_port differs per worker). */
 typedef struct {
-    long accept_port, weight, heartbeat;
+    long accept_port, weight, heartbeat, max_streams;
     const char *token, *peer_id;
 } edge_cfg;
 
@@ -99,6 +102,7 @@ static int run_edge_proc(const edge_cfg *c, long mux_port) {
         opts.weight           = (uint32_t)c->weight;
         opts.heartbeat_ms     = (uint32_t)c->heartbeat;
         opts.public_listen_fd = public_fd;      /* edge opens streams for public conns */
+        opts.max_streams      = (int)c->max_streams; /* backpressure cap (per proc) */
         opts.backend_host     = NULL;
 
         relay *r = relay_new(uplink, &opts);
@@ -145,6 +149,7 @@ static int run_supervisor(const edge_cfg *c, long mux_base, long procs) {
 
 int main(int argc, char **argv) {
     long accept_port = 0, mux_port = 0, weight = 1, heartbeat = 0, procs = 1;
+    long max_streams = 8000;                /* per-proc backpressure cap (0 = off) */
     const char *token = NULL, *peer_id = "edge";
 
     for (int i = 1; i < argc; i++) {
@@ -155,6 +160,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--peer-id") && i+1 < argc) peer_id = argv[++i];
         else if (!strcmp(argv[i], "--weight") && i+1 < argc) weight = strtol(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--heartbeat") && i+1 < argc) heartbeat = strtol(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--max-streams") && i+1 < argc) max_streams = strtol(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
         else { fprintf(stderr, "unknown arg: %s\n", argv[i]); usage(argv[0]); return 2; }
     }
@@ -169,7 +175,7 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_sigint);
     signal(SIGPIPE, SIG_IGN);
 
-    edge_cfg c = { accept_port, weight, heartbeat, token, peer_id };
+    edge_cfg c = { accept_port, weight, heartbeat, max_streams, token, peer_id };
     if (procs > 1) return run_supervisor(&c, mux_port, procs);
     return run_edge_proc(&c, mux_port);
 }

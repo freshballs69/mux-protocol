@@ -78,6 +78,9 @@ struct relay {
 
     int    *dirty; size_t dirty_n, dirty_cap;
 
+    int     nactive;            /* edge: public conns currently open          */
+    int     listen_paused;      /* edge: accept paused (at max_streams)        */
+
     uint8_t recv_buf[262144];
     size_t  recv_len;
 };
@@ -214,6 +217,15 @@ static void conn_destroy(relay *r, int idx) {
     buf_free(&c->s2m); buf_free(&c->m2s);
     c->in_dirty = 0;                            /* drop any stale dirty entry */
     conn_release(r, idx);
+    /* edge: a public slot freed — resume accepting if we were at the cap */
+    if (r->opt.public_listen_fd >= 0) {
+        if (r->nactive > 0) r->nactive--;
+        if (r->listen_paused && (r->opt.max_streams <= 0 || r->nactive < r->opt.max_streams)) {
+            evloop_set(r->loop, r->opt.public_listen_fd, 1, 0, &OWN_LISTEN);
+            r->listen_paused = 0;
+            fprintf(stderr, "[relay] accept resumed (%d streams)\n", r->nactive);
+        }
+    }
 }
 static void conn_maybe_finish(relay *r, int idx) {
     conn *c = &r->conns[idx];
@@ -353,6 +365,17 @@ static void open_backend_conn(relay *r, uint32_t sid, const uint8_t *meta, size_
 
 static void accept_public(relay *r) {
     for (;;) {
+        /* Backpressure: at the stream cap, stop accepting and drop our read
+         * interest on the listener so we don't spin on the backlog. Pending
+         * clients wait in the kernel accept queue; conn_destroy resumes us. */
+        if (r->opt.max_streams > 0 && r->nactive >= r->opt.max_streams) {
+            if (!r->listen_paused) {
+                evloop_set(r->loop, r->opt.public_listen_fd, 0, 0, &OWN_LISTEN);
+                r->listen_paused = 1;
+                fprintf(stderr, "[relay] accept paused at %d streams (cap)\n", r->nactive);
+            }
+            return;
+        }
         char peer[128];
         int fd = net_accept(r->opt.public_listen_fd, peer, sizeof peer);
         if (fd < 0) break;
@@ -364,6 +387,7 @@ static void accept_public(relay *r) {
         conn *c = &r->conns[idx];
         c->sock = fd; c->sid = (uint32_t)sid;
         sidmap_set(r, (uint32_t)sid, idx);
+        r->nactive++;
         conn_apply_interest(r, idx);        /* register with the loop (POLLIN) */
     }
 }

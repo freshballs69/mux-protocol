@@ -28,6 +28,11 @@ typedef struct {
     uint32_t    heartbeat_ms;    /* keepalive interval (0 => default 15s)    */
 
     int         public_listen_fd; /* edge: accept here. -1 if unused         */
+    int         max_streams;      /* edge: cap on concurrent public conns.    */
+                                  /* At the cap the edge stops accepting (new */
+                                  /* clients queue in the kernel backlog)     */
+                                  /* instead of piling up half-open fds and   */
+                                  /* drowning. 0 = unlimited.                 */
 
     const char *backend_host;     /* edge-peer: dial target. NULL if unused  */
     uint16_t    backend_port;
