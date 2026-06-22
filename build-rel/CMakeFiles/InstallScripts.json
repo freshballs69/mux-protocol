@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/vitalii/Documents/mux-protocol/build-rel/cmake_install.cmake",
+		"/Users/vitalii/Documents/mux-protocol/build-rel/tests/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

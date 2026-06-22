@@ -1,0 +1,12 @@
+# ninja log v7
+4	211	1782129230627771175	CMakeFiles/edge.dir/edge/main.c.o	cb67af697948a89a
+2	212	1782129230624814714	CMakeFiles/mux.dir/libmux/src/frame.c.o	ba23586c9eea381e
+3	213	1782129230625882882	CMakeFiles/muxcommon.dir/common/evloop.c.o	7ca80f6bf974c625
+2	216	1782129230625666631	CMakeFiles/muxcommon.dir/common/net.c.o	3128897c134acc8c
+2	230	1782129230625461131	CMakeFiles/muxcommon.dir/common/auth.c.o	1bfdcbaaec9f3f15
+230	315	1782129230853587454	libmuxcommon.a	1adc9ff34b95dc98
+4	316	1782129230627297383	CMakeFiles/muxrelay.dir/common/relay.c.o	2111412e30c9ddd7
+2	443	1782129230625227423	CMakeFiles/mux.dir/libmux/src/session.c.o	e99ae6d47c5baaa9
+444	504	1782129231066779219	libmux.a	fdf2e5de71c7d020
+504	562	1782129231127457866	libmuxrelay.a	cae403740b05ef1b
+562	621	1782129231185154843	edge	4628115d423a5ae7
