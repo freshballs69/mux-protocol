@@ -1,0 +1,29 @@
+# Publishable single-purpose images for edge and edge-peer.
+#   docker build -f deploy/Dockerfile.publish --target edge      -t gig4ch4d/edge:TAG .
+#   docker build -f deploy/Dockerfile.publish --target edge-peer -t gig4ch4d/edge-peer:TAG .
+# Each image defaults to its own binary, so:
+#   docker run gig4ch4d/edge      --accept-port 5000 --mux-port 5001 --token KEY
+#   docker run gig4ch4d/edge-peer --connect EDGE:5001 --worker ... --token KEY
+FROM debian:bookworm-slim AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake ninja-build clang libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang \
+    && cmake --build build --target edge edge-peer
+
+FROM debian:bookworm-slim AS base
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/build/edge      /usr/local/bin/edge
+COPY --from=builder /src/build/edge-peer /usr/local/bin/edge-peer
+RUN mkdir -p /sockets
+
+FROM base AS edge
+ENTRYPOINT ["edge"]
+CMD ["--help"]
+
+FROM base AS edge-peer
+ENTRYPOINT ["edge-peer"]
+CMD ["--help"]
