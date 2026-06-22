@@ -132,12 +132,15 @@ N-replicas-one-socket-each deployment.
 | PSK tunnel auth (HMAC-SHA256) | ✅ |
 | 4. libpeer worker SDK (blocking, threaded) + unix listen | ✅ |
 | Python `muxpeer` binding | ✅ |
-| 5. edge daemon (`poll()`) | ✅ |
+| 5. edge daemon (epoll/kqueue event loop) | ✅ |
 | 6. edge-peer router + SWRR balancing | ✅ |
+| edge scalability: O(ready) loop + raised fd limit | ✅ |
 | libpeer event-loop/selector API (`fileno`/`poll`) | ⬜ |
 | 7. TLS/Noise transport wrapper | ⬜ |
 | 8. P2C balancing + global capacity reporting | ⬜ |
 | 9. io_uring/`splice` zero-copy backend | ⬜ |
 
-> Event loop: portable `poll()` (Linux + macOS). `epoll`/`io_uring`/`kqueue` +
-> `splice` are a later throughput milestone.
+> Event loop: `edge`/relay use `epoll` (Linux) / `kqueue` (macOS/BSD) via a small
+> `evloop` shim — O(ready) per wait, so one thread holds tens of thousands of
+> sockets. Daemons raise `RLIMIT_NOFILE`. `io_uring` + `splice` are a later
+> throughput milestone; the edge-peer router still uses `poll()` (few fds).
