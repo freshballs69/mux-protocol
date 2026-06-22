@@ -82,7 +82,7 @@ typedef struct { uint32_t sid; lp_stream *st; uint8_t used; } reg_slot;
 
 struct lp_client {
     lp_config cfg;
-    char     *host, *token, *peer_id;   /* owned copies                   */
+    char     *host, *token, *peer_id, *listen_addr;  /* owned copies        */
 
     pthread_t       io;
     pthread_mutex_t mtx;
@@ -90,6 +90,7 @@ struct lp_client {
     int             started;
     int             stopping;
 
+    int           listen_fd;            /* bound once in listen mode; -1   */
     int           fd;                   /* tunnel; -1 when down            */
     mux_session  *mux;
     int           authed;
@@ -354,21 +355,44 @@ static void session_down(lp_client *c) {    /* holds mtx */
     while (st) { lp_stream *nx = st->all_next; stream_try_free(c, st); st = nx; }
 }
 
-static int session_up(lp_client *c) {       /* holds mtx on entry; may unlock to dial */
-    pthread_mutex_unlock(&c->mtx);
-    int fd = net_dial(c->host, c->cfg.port);
-    int ok = 0;
-    if (fd >= 0) {
-        struct pollfd p = { .fd = fd, .events = POLLOUT };
+static int session_up(lp_client *c) {       /* holds mtx on entry; unlocks to wait */
+    int listen_mode = (c->listen_addr != NULL);
+    mux_role role = listen_mode ? MUX_ACCEPTOR : MUX_DIALER;
+    int fd = -1, ok = 0;
+
+    if (listen_mode) {
+        if (c->listen_fd < 0) {
+            c->listen_fd = net_listen_addr(c->listen_addr, 16);
+            if (c->listen_fd < 0) { pthread_mutex_unlock(&c->mtx); struct timespec t={0,200000000L}; nanosleep(&t,NULL); pthread_mutex_lock(&c->mtx); return -1; }
+        }
+        int lfd = c->listen_fd;
+        pthread_mutex_unlock(&c->mtx);
         for (;;) {
+            struct pollfd p = { .fd = lfd, .events = POLLIN };
             int rc = poll(&p, 1, 300);
             if (rc < 0) { if (errno == EINTR) continue; break; }
             if (rc == 0) { if (__atomic_load_n(&c->stopping, __ATOMIC_RELAXED)) break; continue; }
-            ok = (net_socket_error(fd) == 0);
+            fd = net_accept(lfd, NULL, 0);
+            ok = (fd >= 0);
             break;
         }
+        pthread_mutex_lock(&c->mtx);
+    } else {
+        pthread_mutex_unlock(&c->mtx);
+        fd = net_addr_is_unix(c->host) ? net_dial_addr(c->host)
+                                       : net_dial(c->host, c->cfg.port);
+        if (fd >= 0) {
+            struct pollfd p = { .fd = fd, .events = POLLOUT };
+            for (;;) {
+                int rc = poll(&p, 1, 300);
+                if (rc < 0) { if (errno == EINTR) continue; break; }
+                if (rc == 0) { if (__atomic_load_n(&c->stopping, __ATOMIC_RELAXED)) break; continue; }
+                ok = (net_socket_error(fd) == 0);
+                break;
+            }
+        }
+        pthread_mutex_lock(&c->mtx);
     }
-    pthread_mutex_lock(&c->mtx);
     if (!ok) { if (fd >= 0) close(fd); return -1; }
 
     mux_config mc; memset(&mc, 0, sizeof mc);
@@ -382,7 +406,8 @@ static int session_up(lp_client *c) {       /* holds mtx on entry; may unlock to
         mc.nonce = c->nonce; mc.nonce_len = sizeof c->nonce;
         mc.auth = c->proof; mc.auth_len = sizeof c->proof;
     }
-    c->mux = mux_session_new(&mc, MUX_DIALER);  /* worker dials => DIALER */
+    net_set_nonblock(fd);
+    c->mux = mux_session_new(&mc, role);
     if (!c->mux) { close(fd); c->fd = -1; return -1; }
     c->fd = fd;
     return 0;
@@ -466,15 +491,17 @@ static void *io_main(void *arg) {
 /* ============================ public API ============================ */
 
 lp_client *lp_connect(const lp_config *cfg) {
-    if (!cfg || !cfg->host || cfg->port == 0) return NULL;
+    if (!cfg) return NULL;
+    if (!cfg->listen_addr && !cfg->host) return NULL;  /* need one transport */
     lp_client *c = (lp_client *)calloc(1, sizeof *c);
     if (!c) return NULL;
     c->cfg = *cfg;
-    c->host = strdup(cfg->host);
+    c->host = cfg->host ? strdup(cfg->host) : NULL;
+    c->listen_addr = cfg->listen_addr ? strdup(cfg->listen_addr) : NULL;
     c->token = cfg->token ? strdup(cfg->token) : NULL;
     c->peer_id = cfg->peer_id ? strdup(cfg->peer_id) : NULL;
     c->fd = -1;
-    if (!c->host) { free(c); return NULL; }
+    c->listen_fd = -1;
     pthread_mutex_init(&c->mtx, NULL);
     pthread_cond_init(&c->accept_cv, NULL);
     if (pipe(c->wake) != 0) { free(c->host); free(c); return NULL; }
@@ -498,7 +525,8 @@ void lp_disconnect(lp_client *c) {
     lp_stream *st = c->all_head;
     while (st) { lp_stream *nx = st->all_next; buf_free(&st->rbuf); buf_free(&st->wbuf);
                  free(st->meta); pthread_cond_destroy(&st->rcv); pthread_cond_destroy(&st->snd); free(st); st = nx; }
-    free(c->reg); free(c->host); free(c->token); free(c->peer_id);
+    if (c->listen_fd >= 0) close(c->listen_fd);
+    free(c->reg); free(c->host); free(c->listen_addr); free(c->token); free(c->peer_id);
     close(c->wake[0]); close(c->wake[1]);
     pthread_mutex_destroy(&c->mtx); pthread_cond_destroy(&c->accept_cv);
     free(c);

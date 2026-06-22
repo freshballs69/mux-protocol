@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 int net_set_nonblock(int fd) {
@@ -105,6 +106,74 @@ int net_dial(const char *host, uint16_t port) {
     }
     freeaddrinfo(res);
     return fd;
+}
+
+static int unix_addr(struct sockaddr_un *sa, const char *path) {
+    memset(sa, 0, sizeof *sa);
+    sa->sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof sa->sun_path)
+        return -1;
+    strncpy(sa->sun_path, path, sizeof sa->sun_path - 1);
+    return 0;
+}
+
+int net_listen_unix(const char *path, int backlog) {
+    struct sockaddr_un sa;
+    if (unix_addr(&sa, path) != 0)
+        return -1;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+    unlink(path);                       /* clear a stale socket file */
+    if (bind(fd, (struct sockaddr *)&sa, sizeof sa) != 0 ||
+        listen(fd, backlog) != 0) {
+        close(fd);
+        return -1;
+    }
+    net_set_nonblock(fd);
+    return fd;
+}
+
+int net_dial_unix(const char *path) {
+    struct sockaddr_un sa;
+    if (unix_addr(&sa, path) != 0)
+        return -1;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+    net_set_nonblock(fd);
+    int r = connect(fd, (struct sockaddr *)&sa, sizeof sa);
+    if (r == 0 || errno == EINPROGRESS)
+        return fd;
+    close(fd);
+    return -1;
+}
+
+int net_addr_is_unix(const char *addr) {
+    if (!addr) return 0;
+    return strncmp(addr, "unix:", 5) == 0 || addr[0] == '/';
+}
+
+static const char *unix_path_of(const char *addr) {
+    return (strncmp(addr, "unix:", 5) == 0) ? addr + 5 : addr;
+}
+
+int net_listen_addr(const char *addr, int backlog) {
+    if (net_addr_is_unix(addr))
+        return net_listen_unix(unix_path_of(addr), backlog);
+    char host[256]; uint16_t port;
+    if (net_parse_addr(addr, host, sizeof host, &port) != 0)
+        return -1;
+    return net_listen(host[0] ? host : NULL, port, backlog);
+}
+
+int net_dial_addr(const char *addr) {
+    if (net_addr_is_unix(addr))
+        return net_dial_unix(unix_path_of(addr));
+    char host[256]; uint16_t port;
+    if (net_parse_addr(addr, host, sizeof host, &port) != 0)
+        return -1;
+    return net_dial(host, port);
 }
 
 int net_socket_error(int fd) {

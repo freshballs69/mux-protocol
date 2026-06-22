@@ -28,8 +28,18 @@ typedef struct lp_client lp_client;
 typedef struct lp_stream lp_stream;
 
 typedef struct {
-    const char *host;        /* edge-peer host to dial                       */
-    uint16_t    port;        /* edge-peer port                               */
+    /* Transport. Exactly one mode:
+     *   listen_addr != NULL  -> the worker LISTENS (binds a unix path or
+     *                           "host:port") and edge-peer dials in. The worker
+     *                           is the mux ACCEPTOR. This is the supervisord
+     *                           model: each replica binds its own socket file.
+     *   else                 -> the worker DIALS (host:port, or set host to a
+     *                           "unix:/path"/"/path" for AF_UNIX). MUX DIALER.
+     */
+    const char *listen_addr;
+    const char *host;        /* edge-peer host (or unix path) to dial        */
+    uint16_t    port;        /* edge-peer TCP port (dial mode)               */
+
     const char *token;       /* pre-shared key (NULL = no auth)              */
     const char *peer_id;     /* advertised identity (NULL ok)                */
     uint32_t    weight;      /* advertised balancing weight (0 => 1)         */

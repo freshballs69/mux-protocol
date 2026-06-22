@@ -52,8 +52,13 @@ target_link_libraries(peer PUBLIC mux muxcommon Threads::Threads)
 add_executable(edge      edge/main.c)
 target_link_libraries(edge PRIVATE muxrelay)
 
-add_executable(edge-peer edge-peer/main.c)
+add_executable(edge-peer edge-peer/main.c edge-peer/router.c)
+target_include_directories(edge-peer PRIVATE edge-peer)
 target_link_libraries(edge-peer PRIVATE muxrelay)
+
+# ---- examples ----
+add_executable(http_worker examples/http_worker.c)
+target_link_libraries(http_worker PRIVATE peer)
 
 # ---- tests ----
 enable_testing()

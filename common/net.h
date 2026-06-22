@@ -20,6 +20,18 @@ int net_accept(int listen_fd, char *peer, size_t peerlen);
  * Returns -1 on immediate failure. */
 int net_dial(const char *host, uint16_t port);
 
+/* AF_UNIX variants. net_listen_unix unlinks any stale socket file first. */
+int net_listen_unix(const char *path, int backlog);
+int net_dial_unix(const char *path);
+
+/* Transport-agnostic helpers driven by an address string:
+ *   "unix:/run/x.sock"  or a bare path starting with '/'  -> AF_UNIX
+ *   "host:port"                                            -> TCP
+ * net_listen_addr binds+listens; net_dial_addr connects (non-blocking). */
+int net_listen_addr(const char *addr, int backlog);
+int net_dial_addr(const char *addr);
+int net_addr_is_unix(const char *addr);
+
 /* Pending SO_ERROR for a socket (0 = connected/ok). */
 int net_socket_error(int fd);
 
