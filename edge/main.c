@@ -76,7 +76,11 @@ int main(int argc, char **argv) {
     long fdlim = net_raise_fd_limit();      /* edge holds one fd per public conn */
     fprintf(stderr, "[edge] fd limit: %ld\n", fdlim);
 
-    int public_fd = net_listen(NULL, (uint16_t)accept_port, 1024);
+    /* Large accept backlog so a burst of tens of thousands of simultaneous
+     * client SYNs is queued (not dropped) while the accept loop drains it. The
+     * kernel still caps this at net.core.somaxconn — raise that too (the
+     * container sets it via sysctls). */
+    int public_fd = net_listen(NULL, (uint16_t)accept_port, 65535);
     if (public_fd < 0) { fprintf(stderr, "[edge] cannot listen on :%ld\n", accept_port); return 1; }
     int mux_fd = net_listen(NULL, (uint16_t)mux_port, 16);
     if (mux_fd < 0) { fprintf(stderr, "[edge] cannot listen on :%ld\n", mux_port); return 1; }

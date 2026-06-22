@@ -84,7 +84,7 @@ async def _conn_loop_ka(host, port, deadline, hist, count):
         pass
 
 
-def _proc(host, port, dur, conc, q, keepalive):
+def _proc(host, port, dur, conc, q, keepalive, rampup):
     try:
         import uvloop
         uvloop.install()
@@ -94,10 +94,20 @@ def _proc(host, port, dur, conc, q, keepalive):
     loopfn = _conn_loop_ka if keepalive else _conn_loop
 
     async def run():
-        deadline = time.monotonic() + dur
+        # Stagger connection opens across `rampup` seconds so 50k clients don't
+        # all SYN at t=0 (a thundering herd that overflows the edge's accept
+        # backlog). Real clients arrive spread over time; the deadline is pushed
+        # out by rampup so every connection still gets the full duration.
+        deadline = time.monotonic() + rampup + dur
         hist = [0] * NB
         count = [0, 0]                                 # [ok, err]
-        await asyncio.gather(*[loopfn(host, port, deadline, hist, count) for _ in range(conc)])
+
+        async def staggered(i):
+            if rampup > 0 and conc > 1:
+                await asyncio.sleep(rampup * i / conc)
+            await loopfn(host, port, deadline, hist, count)
+
+        await asyncio.gather(*[staggered(i) for i in range(conc)])
         return count, hist
 
     count, hist = asyncio.run(run())
@@ -111,13 +121,14 @@ def main():
     ap.add_argument("-d", type=int, default=12, help="duration seconds")
     ap.add_argument("-p", type=int, default=mp.cpu_count(), help="processes (cores)")
     ap.add_argument("--keepalive", action="store_true", help="reuse connections (HTTP keep-alive)")
+    ap.add_argument("--rampup", type=float, default=3.0, help="seconds to stagger connection opens over")
     a = ap.parse_args()
     host, port = a.target.rsplit(":", 1)
     port = int(port)
     per = max(1, a.c // a.p)
 
     q = mp.Queue()
-    procs = [mp.Process(target=_proc, args=(host, port, a.d, per, q, a.keepalive)) for _ in range(a.p)]
+    procs = [mp.Process(target=_proc, args=(host, port, a.d, per, q, a.keepalive, a.rampup)) for _ in range(a.p)]
     t0 = time.monotonic()
     for p in procs:
         p.start()
