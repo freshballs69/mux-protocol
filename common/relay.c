@@ -80,11 +80,15 @@ struct relay {
 
     int     nactive;            /* edge: public conns currently open          */
     int     listen_paused;      /* edge: accept paused (at max_streams)        */
+    int     stop;               /* THIS tunnel should end (not the process)   */
 
     uint8_t recv_buf[262144];
     size_t  recv_len;
 };
 
+/* Process-wide shutdown (SIGTERM/SIGINT) — tears down the WHOLE edge loop.
+ * Per-tunnel termination uses relay->stop instead, so ending one uplink does
+ * NOT poison the next relay_run() (that bug caused connect-but-never-auth flap). */
 static volatile int g_stop = 0;
 void relay_request_stop(void) { g_stop = 1; }
 
@@ -307,7 +311,7 @@ static void handle_events(relay *r) {
                 mux_auth_proof(r->opt.token, strlen(r->opt.token), e.u.hello.nonce, e.u.hello.nonce_len, expect);
                 if (e.u.hello.auth_len == SHA256_DIGEST_LEN && ct_equal(expect, e.u.hello.auth, SHA256_DIGEST_LEN)) {
                     r->authed = 1; fprintf(stderr, "[relay] tunnel authenticated (weight=%u)\n", e.u.hello.weight);
-                } else { fprintf(stderr, "[relay] AUTH FAILED — dropping tunnel\n"); mux_goaway(r->mux, MUX_CODE_REFUSED); g_stop = 1; }
+                } else { fprintf(stderr, "[relay] AUTH FAILED — dropping tunnel\n"); mux_goaway(r->mux, MUX_CODE_REFUSED); r->stop = 1; }
             } else fprintf(stderr, "[relay] tunnel up (weight=%u, no auth)\n", e.u.hello.weight);
             break;
         case MUX_EV_STREAM_OPENED:
@@ -345,7 +349,7 @@ static void handle_events(relay *r) {
         }
         case MUX_EV_GOAWAY: fprintf(stderr, "[relay] peer GOAWAY reason=%u\n", e.u.goaway.reason); break;
         case MUX_EV_CAPACITY: fprintf(stderr, "[relay] peer CAPACITY weight=%u\n", e.u.capacity.weight); break;
-        case MUX_EV_FATAL: fprintf(stderr, "[relay] session FATAL code=%u\n", e.u.fatal.code); g_stop = 1; break;
+        case MUX_EV_FATAL: fprintf(stderr, "[relay] session FATAL code=%u\n", e.u.fatal.code); r->stop = 1; break;
         default: break;
         }
     }
@@ -461,12 +465,12 @@ int relay_run(relay *r) {
         evloop_set(r->loop, r->opt.public_listen_fd, 1, 0, &OWN_LISTEN);
 
     ev_event evs[1024];
-    while (!g_stop) {
+    while (!g_stop && !r->stop) {
         struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
         uint64_t now = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
         uint64_t deadline = mux_on_timer(r->mux, now);
         handle_events(r);
-        if (g_stop) break;
+        if (g_stop || r->stop) break;
         if (tunnel_flush(r) < 0) break;
         flush_dirty(r);
         update_tunnel_interest(r);
@@ -480,8 +484,8 @@ int relay_run(relay *r) {
         for (int i = 0; i < n; i++) {
             void *ud = evs[i].udata;
             if (ud == &OWN_TUNNEL) {
-                if (evs[i].readable) { if (tunnel_read(r) < 0) { g_stop = 1; break; } }
-                if (!g_stop && evs[i].writable) tunnel_flush(r);
+                if (evs[i].readable) { if (tunnel_read(r) < 0) { r->stop = 1; break; } }
+                if (!g_stop && !r->stop && evs[i].writable) tunnel_flush(r);
             } else if (ud == &OWN_LISTEN) {
                 accept_public(r);
             } else {
