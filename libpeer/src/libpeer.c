@@ -75,6 +75,12 @@ struct lp_stream {
     lp_stream *pending_next;
     lp_stream *accept_next;     /* accept queue link                      */
     lp_stream *all_next, *all_prev;
+
+    /* readiness (lp_poll) mode */
+    int        ev_pending;      /* OR of LP_READABLE/LP_WRITABLE/LP_CLOSED */
+    int        in_ready;
+    int        want_writable;   /* a non-blocking write hit the high-water */
+    lp_stream *ready_next;
 };
 
 /* ---- sid -> stream registry (open addressing) ---- */
@@ -104,6 +110,12 @@ struct lp_client {
 
     lp_stream *pending_head;            /* streams needing I/O-thread work */
     lp_stream *all_head;               /* every live stream               */
+
+    /* readiness (lp_poll) mode */
+    int        poll_mode;              /* enabled on first lp_fileno      */
+    int        notify[2];              /* self-pipe; notify[0] = lp_fileno */
+    int        notified;               /* coalesce: a byte is pending      */
+    lp_stream *ready_head;             /* streams with ev_pending set      */
 
     uint8_t recv_buf[262144];
     size_t  recv_len;
@@ -167,6 +179,21 @@ static void pending_push(lp_client *c, lp_stream *st) {  /* caller holds mtx */
     c->pending_head = st;
 }
 
+/* readiness mode: wake the app's event loop via the self-pipe (coalesced). */
+static void notify_raise(lp_client *c) {     /* caller holds mtx */
+    if (!c->poll_mode || c->notified) return;
+    c->notified = 1;
+    uint8_t b = 1;
+    ssize_t r = write(c->notify[1], &b, 1); (void)r;
+}
+/* flag readiness event bits on a stream and queue it for lp_poll. */
+static void ready_mark(lp_client *c, lp_stream *st, int bits) {  /* holds mtx */
+    if (!c->poll_mode) return;
+    st->ev_pending |= bits;
+    if (!st->in_ready) { st->in_ready = 1; st->ready_next = c->ready_head; c->ready_head = st; }
+    notify_raise(c);
+}
+
 /* ============================ stream lifecycle ============================ */
 
 static lp_stream *stream_new(lp_client *c, uint32_t sid, const uint8_t *meta, size_t mlen) {
@@ -185,7 +212,7 @@ static lp_stream *stream_new(lp_client *c, uint32_t sid, const uint8_t *meta, si
 /* Free a stream (I/O thread only), once proto-done and app-released. */
 static void stream_try_free(lp_client *c, lp_stream *st) {
     if (!(st->proto_done && st->app_closed)) return;
-    if (st->in_pending) return;             /* will be freed after draining */
+    if (st->in_pending || st->in_ready) return;  /* freed after it drains */
     if (st->in_reg) {                        /* remove from registry */
         size_t mask = c->reg_cap - 1, i = reg_mix(st->sid, mask);
         for (size_t p = 0; p <= mask; p++) {
@@ -231,6 +258,7 @@ static void handle_events(lp_client *c) {   /* holds mtx */
             if (c->accept_tail) c->accept_tail->accept_next = st; else c->accept_head = st;
             c->accept_tail = st;
             pthread_cond_signal(&c->accept_cv);
+            notify_raise(c);                 /* poll mode: ACCEPT readiness */
             break;
         }
         case MUX_EV_STREAM_DATA: {
@@ -238,6 +266,7 @@ static void handle_events(lp_client *c) {   /* holds mtx */
             if (!st) break;
             buf_append(&st->rbuf, e.u.data.data, e.u.data.data_len);
             pthread_cond_signal(&st->rcv);
+            ready_mark(c, st, LP_READABLE);
             break;
         }
         case MUX_EV_STREAM_CLOSED: {
@@ -246,6 +275,7 @@ static void handle_events(lp_client *c) {   /* holds mtx */
             st->eof = 1;
             if (st->fin_sent) { st->proto_done = 1; }
             pthread_cond_signal(&st->rcv);
+            ready_mark(c, st, LP_READABLE | LP_CLOSED);  /* wake reader to see EOF */
             stream_try_free(c, st);
             break;
         }
@@ -255,6 +285,7 @@ static void handle_events(lp_client *c) {   /* holds mtx */
             st->reset = 1; st->eof = 1; st->proto_done = 1;
             pthread_cond_signal(&st->rcv);
             pthread_cond_signal(&st->snd);
+            ready_mark(c, st, LP_READABLE | LP_CLOSED);
             stream_try_free(c, st);
             break;
         }
@@ -282,8 +313,10 @@ static void flush_wbuf(lp_client *c, lp_stream *st) {  /* holds mtx */
         }
         if (w <= 0) break;                  /* window full or error */
     }
-    if (buf_avail(&st->wbuf) <= LP_WBUF_HIGH / 2)
+    if (buf_avail(&st->wbuf) <= LP_WBUF_HIGH / 2) {
         pthread_cond_signal(&st->snd);      /* room again for blocked writers */
+        if (st->want_writable) { st->want_writable = 0; ready_mark(c, st, LP_WRITABLE); }
+    }
 }
 
 /* perform queued app requests for one stream, then free it if it is fully done */
@@ -343,6 +376,7 @@ static void session_down(lp_client *c) {    /* holds mtx */
         if (!st->proto_done) { st->reset = 1; st->eof = 1; st->proto_done = 1; }
         pthread_cond_signal(&st->rcv);
         pthread_cond_signal(&st->snd);
+        ready_mark(c, st, LP_READABLE | LP_CLOSED);  /* wake poll-mode loops */
     }
     c->pending_head = NULL;
     for (lp_stream *st = c->all_head; st; st = st->all_next) st->in_pending = 0;
@@ -502,12 +536,18 @@ lp_client *lp_connect(const lp_config *cfg) {
     c->peer_id = cfg->peer_id ? strdup(cfg->peer_id) : NULL;
     c->fd = -1;
     c->listen_fd = -1;
+    c->notify[0] = c->notify[1] = -1;
     pthread_mutex_init(&c->mtx, NULL);
     pthread_cond_init(&c->accept_cv, NULL);
     if (pipe(c->wake) != 0) { free(c->host); free(c); return NULL; }
     net_set_nonblock(c->wake[0]); net_set_nonblock(c->wake[1]);
+    if (pipe(c->notify) != 0) {            /* readiness self-pipe for lp_fileno */
+        close(c->wake[0]); close(c->wake[1]); free(c->host); free(c); return NULL;
+    }
+    net_set_nonblock(c->notify[0]); net_set_nonblock(c->notify[1]);
     if (pthread_create(&c->io, NULL, io_main, c) != 0) {
-        close(c->wake[0]); close(c->wake[1]); free(c->host); free(c);
+        close(c->wake[0]); close(c->wake[1]); close(c->notify[0]); close(c->notify[1]);
+        free(c->host); free(c);
         return NULL;
     }
     c->started = 1;
@@ -528,6 +568,8 @@ void lp_disconnect(lp_client *c) {
     if (c->listen_fd >= 0) close(c->listen_fd);
     free(c->reg); free(c->host); free(c->listen_addr); free(c->token); free(c->peer_id);
     close(c->wake[0]); close(c->wake[1]);
+    if (c->notify[0] >= 0) close(c->notify[0]);
+    if (c->notify[1] >= 0) close(c->notify[1]);
     pthread_mutex_destroy(&c->mtx); pthread_cond_destroy(&c->accept_cv);
     free(c);
 }
@@ -596,4 +638,91 @@ int lp_close(lp_stream *s) {
 const uint8_t *lp_stream_meta(lp_stream *s, size_t *len) {
     if (len) *len = s ? s->meta_len : 0;
     return s ? s->meta : NULL;
+}
+
+/* ---------------------- readiness (event-loop) API ---------------------- */
+
+int lp_fileno(lp_client *c) {
+    if (!c) return -1;
+    pthread_mutex_lock(&c->mtx);
+    c->poll_mode = 1;                        /* start signalling readiness */
+    int fd = c->notify[0];
+    pthread_mutex_unlock(&c->mtx);
+    return fd;
+}
+
+int lp_poll(lp_client *c, lp_event *out, int max) {
+    if (!c || !out || max <= 0) return 0;
+    pthread_mutex_lock(&c->mtx);
+    /* drain the readiness pipe; the I/O thread re-arms it on the next event */
+    uint8_t drain[256]; while (read(c->notify[0], drain, sizeof drain) > 0) {}
+    c->notified = 0;
+
+    int n = 0;
+    /* ACCEPT first, so the app maps stream->handler before its READABLE event */
+    while (n < max && c->accept_head) {
+        lp_stream *st = c->accept_head;
+        c->accept_head = st->accept_next;
+        if (!c->accept_head) c->accept_tail = NULL;
+        st->accept_next = NULL;
+        out[n].stream = st; out[n].events = LP_ACCEPT;
+        n++;
+    }
+    /* then per-stream READABLE/WRITABLE/CLOSED from the ready list */
+    while (n < max && c->ready_head) {
+        lp_stream *st = c->ready_head;
+        c->ready_head = st->ready_next;
+        st->ready_next = NULL; st->in_ready = 0;
+        int bits = st->ev_pending;
+        st->ev_pending = 0;
+        if (st->app_closed) {                /* app no longer cares; reap it */
+            stream_try_free(c, st);
+            continue;
+        }
+        out[n].stream = st; out[n].events = bits;
+        n++;
+    }
+    /* more left than fit: re-arm so the loop fires again */
+    if (c->accept_head || c->ready_head) { c->notified = 0; notify_raise(c); }
+    pthread_mutex_unlock(&c->mtx);
+    return n;
+}
+
+ssize_t lp_read_nb(lp_stream *s, void *buf, size_t n) {
+    if (!s || n == 0) return 0;
+    lp_client *c = s->cli;
+    pthread_mutex_lock(&c->mtx);
+    if (s->reset) { pthread_mutex_unlock(&c->mtx); return -1; }
+    size_t avail = buf_avail(&s->rbuf);
+    if (avail == 0) {
+        int eof = s->eof;
+        pthread_mutex_unlock(&c->mtx);
+        return eof ? 0 : LP_AGAIN;
+    }
+    size_t take = n < avail ? n : avail;
+    memcpy(buf, s->rbuf.data + s->rbuf.head, take);
+    s->rbuf.head += take;
+    if (s->rbuf.head == s->rbuf.len) { s->rbuf.head = s->rbuf.len = 0; }
+    s->consume_pending += take;
+    pending_push(c, s);
+    pthread_mutex_unlock(&c->mtx);
+    io_wake(c);
+    return (ssize_t)take;
+}
+
+ssize_t lp_write_nb(lp_stream *s, const void *buf, size_t n) {
+    if (!s || n == 0) return 0;
+    lp_client *c = s->cli;
+    pthread_mutex_lock(&c->mtx);
+    if (s->reset || s->fin_sent || c->stopping) { pthread_mutex_unlock(&c->mtx); return -1; }
+    if (buf_avail(&s->wbuf) >= LP_WBUF_HIGH) {   /* full: ask for a WRITABLE event */
+        s->want_writable = 1;
+        pthread_mutex_unlock(&c->mtx);
+        return LP_AGAIN;
+    }
+    if (buf_append(&s->wbuf, (const uint8_t *)buf, n) != 0) { pthread_mutex_unlock(&c->mtx); return -1; }
+    pending_push(c, s);
+    pthread_mutex_unlock(&c->mtx);
+    io_wake(c);
+    return (ssize_t)n;
 }

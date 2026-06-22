@@ -80,6 +80,43 @@ int lp_close(lp_stream *s);
  * as a view valid for the stream's lifetime. *len set to its length. */
 const uint8_t *lp_stream_meta(lp_stream *s, size_t *len);
 
+/* ------------------------------------------------------------------ */
+/* Readiness API — integrate with the app's OWN event loop (select /   */
+/* poll / epoll / asyncio) over a SINGLE fd, instead of blocking calls. */
+/* ------------------------------------------------------------------ */
+
+#define LP_AGAIN (-2)            /* lp_read_nb/lp_write_nb would block   */
+
+/* Event bits returned by lp_poll. */
+enum {
+    LP_ACCEPT   = 1,            /* ev.stream is a NEW inbound stream     */
+    LP_READABLE = 2,            /* data available (drain with lp_read_nb)*/
+    LP_WRITABLE = 4,            /* send buffer drained; retry lp_write_nb*/
+    LP_CLOSED   = 8             /* peer FIN / reset                      */
+};
+
+typedef struct {
+    lp_stream *stream;
+    int        events;          /* OR of LP_* bits                       */
+} lp_event;
+
+/* A readable fd that signals (level-triggered) when lp_poll has events to
+ * return. Register it in the app's loop (e.g. loop.add_reader in asyncio).
+ * Calling this switches the client into readiness mode. Returns -1 if none. */
+int lp_fileno(lp_client *c);
+
+/* Non-blocking: drain the readiness fd and return up to max ready events.
+ * Returns the count (>= 0). Edge-triggered for READABLE/WRITABLE — drain each
+ * stream with lp_read_nb until LP_AGAIN. */
+int lp_poll(lp_client *c, lp_event *out, int max);
+
+/* Non-blocking read: > 0 bytes, 0 on EOF, -1 on reset, LP_AGAIN if no data. */
+ssize_t lp_read_nb(lp_stream *s, void *buf, size_t n);
+
+/* Non-blocking write: returns n queued, or LP_AGAIN if the send buffer is full
+ * (a later LP_WRITABLE event will fire). -1 on a dead stream. */
+ssize_t lp_write_nb(lp_stream *s, const void *buf, size_t n);
+
 #ifdef __cplusplus
 }
 #endif

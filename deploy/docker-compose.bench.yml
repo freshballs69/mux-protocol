@@ -1,0 +1,38 @@
+# Benchmark stack: same topology as docker-compose.yml but with raised fd limits
+# and a selectable worker module (APP=app.py threaded, or app_async.py asyncio).
+# The loadgen runs as a separate `docker run` on this network (see deploy/bench.sh).
+services:
+  edge:
+    image: mux-daemons:latest
+    command: edge --accept-port 5000 --mux-port 5001 --token ${MUX_TOKEN:-s3cr3t}
+    ulimits:
+      nofile: { soft: 1048576, hard: 1048576 }
+
+  app:
+    build:
+      context: ..
+      dockerfile: examples/python-app/Dockerfile
+    image: mux-app:latest
+    environment:
+      MUX_TOKEN: ${MUX_TOKEN:-s3cr3t}
+      APP: ${APP:-app.py}
+    ulimits:
+      nofile: { soft: 1048576, hard: 1048576 }
+    volumes:
+      - sockets:/sockets
+
+  edge-peer:
+    image: mux-daemons:latest
+    command: >
+      edge-peer --connect edge:5001
+      --worker /sockets/app_00.sock --worker /sockets/app_01.sock
+      --worker /sockets/app_02.sock --worker /sockets/app_03.sock
+      --token ${MUX_TOKEN:-s3cr3t}
+    ulimits:
+      nofile: { soft: 1048576, hard: 1048576 }
+    volumes:
+      - sockets:/sockets
+    depends_on: [edge, app]
+
+volumes:
+  sockets:

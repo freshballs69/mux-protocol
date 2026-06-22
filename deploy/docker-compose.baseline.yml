@@ -1,0 +1,12 @@
+# Baseline control: 4 plain asyncio HTTP servers sharing one port via
+# SO_REUSEPORT (kernel-balanced accepts), NO mux. Benchmarked by the same
+# loadgen as the mux stack so the difference is the mux overhead.
+services:
+  baseline:
+    image: python:3.12-slim
+    command: >
+      sh -c "for i in 0 1 2 3; do python3 /b/baseline.py 5000 & done; wait"
+    volumes:
+      - ../bench:/b:ro
+    ulimits:
+      nofile: { soft: 1048576, hard: 1048576 }
